@@ -1,156 +1,160 @@
-# java-gen
 import os
-import re
-from typing import Dict, List, Set, Tuple
-import javalang
 
-def extract_java_code_blocks(src_dir: str, keywords: List[str]) -> Dict[str, List[str]]:
-    """
-    Uses javalang to extract methods containing keywords.
-    Returns a dict mapping file paths to lists of code snippets.
-    """
-    file_counts = {}
-    file_code = {}
-    
-    # Find Java files containing all keywords
-    for root, dirs, files in os.walk(src_dir):
-        for file in files:
-            if file.endswith(".java"):
-                path = os.path.join(root, file)
-                
-                try:
-                    with open(path, encoding="utf-8", errors="ignore") as f:
-                        code = f.read()
-                except Exception:
-                    continue
-                
-                # Check if all keywords appear in the file
-                if all(kw.lower() in code.lower() for kw in keywords):
-                    file_counts[path] = 1
-                    file_code[path] = code
-    
-    # Sort and select top files
-    ranked_files = sorted(file_counts.items(), key=lambda x: x[1], reverse=True)
-    top_files = [file for file, count in ranked_files[:3]] if ranked_files else []
-    
-    results = {}
-    
-    for path in top_files:
-        code = file_code[path]
-        
+from fiservai import FiservAI
+from fiserv_ai_utils import SimpleConversationManager
+from import_openpyxl import get_xpath_fields
+from dotenv import load_dotenv
+
+import yaml
+from generate_field_assertions_yaml import generate_service_details, save_yaml_file
+
+
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+from extract_java_code_blocks import extract_java_code_blocks
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Helper to create a prompt for each field
+def create_test_objective_prompt(field_metadata):
+    prompt = (
+        "You are an expert QA test objectives generator for ESF (Enterprise Service Framework) APIs. "
+        "Given the following field metadata, generate a realistic, detailed, and relevant test objective for this field. "
+        "Output ONLY a single tab-separated line (no header) matching the columns below.\n\n"
+        "Columns (tab-separated, one line, no header):\n"
+        "Test Case Id\tType of Validation\tObjective(Short Description)\tTest Steps\tPrerequisite\tTest Data\tExpected Results\tActual Results\tReview Comments\tManual/Automation\tAutomation pattern\tMapping corelation\tComments\n\n"
+        "Example:\n"
+        "TC_001\tField Validation\tVerify PostalCode is accepted when valid\tSend request with valid PostalCode\tAPI is up\tPostalCode=12345\tResponse code 200, PostalCode present in response\tResponse as expected\tNone\tAutomation\tPositive\tPartyRec/PersonPartyInfo/PersonData/Contact/PostAddr/PostalCode\tNone\n\n"
+        "Field metadata for this test objective:\n"
+    )
+    for key, value in field_metadata.items():
+        prompt += f"{key}: {value}\n"
+    prompt += (
+        "\nGenerate a realistic test objective for this field, following the example and columns above. "
+        "Respond ONLY with a single tab-separated line. Do NOT include any explanation, markdown, or formatting."
+    )
+    return prompt
+
+# Load FiservAI credentials from environment
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+BASE_URL = os.getenv("BASE_URL")
+
+client = FiservAI.FiservAI(API_KEY, API_SECRET, base_url=BASE_URL, temperature=0.0)
+
+class DummyTools:
+    @classmethod
+    def get_tools_metadata(cls):
+        return []
+
+def main():
+
+    hardcoded_field = "PartyRec/PersonPartyInfo/PersonData/Contact/PostAddr/PostalCode"
+    fields_metadata = get_xpath_fields(
+        "PartyInq-PRM.xlsm",
+        with_metadata=True,
+        target_xpath=hardcoded_field
+    )
+    if not fields_metadata:
+        print(f"Field '{hardcoded_field}' not found in mapping sheet.")
+        return
+    field = fields_metadata[0]
+
+    src_dir = input("Enter path to Java source directory: ").strip()
+    if not os.path.isdir(src_dir):
+        print(f"Source directory '{src_dir}' does not exist.")
+        return
+
+    print(f"[DEBUG] Using Java source directory: {src_dir}")
+    # Only use the last segment of the field path
+    field_last = hardcoded_field.split('/')[-1]
+    field_keywords = [field_last]
+    print(f"[DEBUG] Field last segment keyword: {field_keywords}")
+    backend_xpath = field.get('backend_xpath')
+    backend_last = None
+    if backend_xpath and isinstance(backend_xpath, str):
+        backend_segments = [seg for seg in backend_xpath.split('/') if seg]
+        backend_last = backend_segments[-1] if backend_segments else None
+        print(f"[DEBUG] Backend xpath last segment: {backend_last}")
+        if backend_last:
+            field_keywords.append(backend_last)
+    print(f"[DEBUG] Final field keywords for Java code search: {field_keywords}")
+
+    # Call extract_java_code_blocks, which now handles ranking and selection internally
+    java_code_blocks = extract_java_code_blocks(src_dir, field_keywords)
+    print(f"[DEBUG] Java code blocks found: {len(java_code_blocks)} files")
+    code_context = ""
+    code_blocks_txt = ""
+    for file, snippets in java_code_blocks.items():
+        print(f"[DEBUG] File: {file}, Snippets found: {len(snippets)}")
+        for snip in snippets:
+            block = f"\nFile: {file}\n--- Relevant Block ---\n{snip}\n"
+            code_context += block
+            code_blocks_txt += block
+
+    output_txt_path = os.path.join(os.getcwd(), "java_code_blocks_found.txt")
+    try:
+        with open(output_txt_path, "w", encoding="utf-8") as f:
+            f.write(code_blocks_txt)
+        print(f"[DEBUG] Java code blocks written to: {output_txt_path}")
+    except Exception as e:
+        print(f"[ERROR] Could not write code blocks to file: {e}")
+
+    convo_mgr = SimpleConversationManager(40)
+    print("Conversational Test Objective Generator. Type 'clear' to reset chat, 'exit' to quit.\n")
+    # First, send the metadata prompt + code context to the AI and print the response
+    prompt = create_test_objective_prompt(field)
+    if code_context:
+        prompt += f"\nRelevant code context from Java source:\n{code_context}"
+    try:
+        response = client.chat_completion(prompt)
+        content = response.choices[0].message.content.strip()
+        print(f"AI: {content}\n{'-'*60}")
+        # Optionally, store the initial AI response in conversation history with a dummy user input
+        convo_mgr.add_turn("[metadata prompt]", content)
+    except Exception as e:
+        print(f"Error: {e}")
+        return
+
+    while True:
+        user_input = input("You: ").strip()
+        if user_input.lower() == "exit":
+            print("Exiting.")
+            break
+        if user_input.lower() == "clear":
+            convo_mgr.clear()
+            print("Chat history cleared.")
+            # Re-send the metadata prompt + code context after clearing
+            prompt = create_test_objective_prompt(field)
+            if code_context:
+                prompt += f"\nRelevant code context from Java source:\n{code_context}"
+            try:
+                response = client.chat_completion(prompt)
+                content = response.choices[0].message.content.strip()
+                print(f"AI: {content}\n{'-'*60}")
+                convo_mgr.add_turn("[metadata prompt]", content)
+            except Exception as e:
+                print(f"Error: {e}")
+            continue
+        # Compose prompt with conversation history and user input
+        conversation = convo_mgr.get_conversation()
+        prompt = create_test_objective_prompt(field)
+        if code_context:
+            prompt += f"\nRelevant code context from Java source:\n{code_context}"
+        for turn in conversation:
+            if turn['role'] == 'user':
+                prompt += f"\nUser: {turn['content']}"
+            elif turn['role'] == 'assistant':
+                prompt += f"\nAI: {turn['content']}"
+        prompt += f"\nUser: {user_input}"
         try:
-            tree = javalang.parse.parse(code)
+            response = client.chat_completion(prompt)
+            content = response.choices[0].message.content.strip()
+            print(f"AI: {content}\n{'-'*60}")
+            convo_mgr.add_turn(user_input, content)
         except Exception as e:
-            print(f"Failed to parse {path}: {e}")
-            continue
-        
-        code_lines = code.splitlines()
-        processed_methods = set()  # Track processed methods to avoid duplicates
-        
-        # Extract methods containing keywords
-        for path_tuple, node in tree.filter(javalang.tree.MethodDeclaration):
-            if not hasattr(node, 'position') or node.position is None:
-                continue
-                
-            method_name = node.name
-            
-            # Create unique method signature
-            param_types = tuple(
-                p.type.name if hasattr(p.type, 'name') else str(p.type) 
-                for p in getattr(node, 'parameters', [])
-            )
-            method_sig = (method_name, param_types)
-            
-            # Skip if already processed
-            if method_sig in processed_methods:
-                continue
-            
-            start_line = node.position.line - 1  # Convert to 0-based indexing
-            
-            # Find method end more accurately
-            end_line = find_method_end(code_lines, start_line)
-            
-            if end_line >= len(code_lines):
-                end_line = len(code_lines) - 1
-            
-            # Extract method snippet
-            snippet = "\n".join(code_lines[start_line:end_line + 1])
-            
-            # Check if method contains any keyword (excluding comments and annotations)
-            if contains_relevant_keywords(snippet, keywords):
-                if path not in results:
-                    results[path] = []
-                
-                # Add method signature as comment for clarity
-                method_header = f"// Method: {method_name}({', '.join(param_types)})"
-                final_snippet = method_header + "\n" + snippet
-                
-                results[path].append(final_snippet)
-                processed_methods.add(method_sig)
-    
-    return results
+            print(f"Error: {e}")
 
-def find_method_end(code_lines: List[str], start_line: int) -> int:
-    """
-    Find the end line of a method by tracking brace balance.
-    """
-    brace_count = 0
-    in_method_body = False
-    
-    for i in range(start_line, len(code_lines)):
-        line = code_lines[i].strip()
-        
-        # Skip empty lines and comments
-        if not line or line.startswith('//') or line.startswith('/*') or line.startswith('*'):
-            continue
-        
-        # Count braces
-        for char in line:
-            if char == '{':
-                brace_count += 1
-                in_method_body = True
-            elif char == '}':
-                brace_count -= 1
-                
-                # If we've closed all braces and we were in the method body
-                if brace_count == 0 and in_method_body:
-                    return i
-    
-    # Fallback: return last line if braces don't balance
-    return len(code_lines) - 1
-
-def contains_relevant_keywords(snippet: str, keywords: List[str]) -> bool:
-    """
-    Check if snippet contains keywords, excluding comments and annotations.
-    """
-    lines = snippet.split('\n')
-    
-    for line in lines:
-        stripped = line.strip()
-        
-        # Skip comments and annotations
-        if (stripped.startswith('@') or 
-            stripped.startswith('//') or 
-            stripped.startswith('/*') or 
-            stripped.startswith('*')):
-            continue
-        
-        # Check for keywords in actual code
-        if any(kw.lower() in stripped.lower() for kw in keywords):
-            return True
-    
-    return False
-
-# Example usage
 if __name__ == "__main__":
-    # Test the function
-    keywords = ["your", "keywords", "here"]
-    src_directory = "/path/to/your/java/source"
-    
-    results = extract_java_code_blocks(src_directory, keywords)
-    
-    for file_path, methods in results.items():
-        print(f"\n=== File: {file_path} ===")
-        for i, method in enumerate(methods, 1):
-            print(f"\n--- Method {i} ---")
-            print(method)
+    main()
