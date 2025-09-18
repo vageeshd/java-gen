@@ -1,407 +1,350 @@
 import os
-import json
-from typing import Dict, List, Any, Optional
-from fiservai import FiservAI
-from fiserv_ai_utils import SimpleConversationManager
-from import_openpyxl import get_xpath_fields
-from dotenv import load_dotenv
+import re
+from typing import Dict, List, Set, Tuple, Optional
+import javalang
+from dataclasses import dataclass
+from collections import defaultdict
 
-import yaml
-from generate_field_assertions_yaml import generate_service_details, save_yaml_file
-
-import sys
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
-from extract_java_code_blocks import extract_java_code_blocks
-
-# Load environment variables from .env file
-load_dotenv()
-
-class TestObjectiveGenerator:
-    def __init__(self, api_key: str, api_secret: str, base_url: str):
-        self.client = FiservAI.FiservAI(api_key, api_secret, base_url=base_url, temperature=0.2)
-        
-    def create_comprehensive_prompt(self, field_metadata: Dict[str, Any], java_code_context: str = "") -> str:
-        """Create a detailed, comprehensive prompt for test objective generation."""
-        
-        prompt = """You are an expert QA test objectives generator for ESF (Enterprise Service Framework) APIs. 
-Your role is to generate comprehensive, realistic, and detailed test objectives based STRICTLY on the provided field metadata and Java code context.
-
-IMPORTANT CONSTRAINTS:
-1. Base your test objectives ONLY on the provided metadata and code
-2. Do NOT make assumptions about validation rules not explicitly shown in the code
-3. If validation logic is unclear from the code, ASK specific questions instead of assuming
-4. Focus on what you can definitively determine from the provided information
-5. Generate multiple test cases covering different scenarios when the code shows multiple validation paths
-
-OUTPUT FORMAT:
-Generate test objectives as tab-separated lines with these columns:
-Test Case Id | Type of Validation | Objective(Short Description) | Test Steps | Prerequisite | Test Data | Expected Results | Actual Results | Review Comments | Manual/Automation | Automation pattern | Mapping correlation | Comments
-
-FIELD METADATA PROVIDED:
-"""
-        
-        # Add field metadata in a structured way
-        for key, value in field_metadata.items():
-            prompt += f"{key}: {value}\n"
-        
-        if java_code_context:
-            prompt += f"""
-
-JAVA CODE CONTEXT PROVIDED:
-{java_code_context}
-
-ANALYSIS INSTRUCTIONS:
-Based on the Java code above, analyze:
-1. What validation rules are explicitly implemented?
-2. What data types and constraints are enforced?
-3. What error conditions are handled?
-4. What are the success scenarios?
-5. Are there any business logic rules visible in the code?
-
-Generate test cases for each distinct validation path you can identify in the code.
-"""
-        else:
-            prompt += """
-
-NO JAVA CODE CONTEXT PROVIDED.
-Generate basic test objectives based only on the field metadata above.
-"""
-        
-        prompt += """
-
-EXAMPLE OUTPUT FORMAT:
-TC_001	Field Validation	Verify PostalCode accepts valid 5-digit format	Send request with PostalCode="12345"	API is up	PostalCode=12345	Response code 200, PostalCode present in response	Response as expected	None	Automation	Positive	PartyRec/PersonPartyInfo/PersonData/Contact/PostAddr/PostalCode	Based on field metadata
-TC_002	Field Validation	Verify PostalCode rejects invalid format	Send request with PostalCode="INVALID"	API is up	PostalCode=INVALID	Response code 400, validation error message	Error as expected	None	Automation	Negative	PartyRec/PersonPartyInfo/PersonData/Contact/PostAddr/PostalCode	Based on field metadata
-
-GENERATE TEST OBJECTIVES NOW:
-If you need clarification about any aspect of the validation logic or business rules that are not clear from the provided information, please ASK SPECIFIC QUESTIONS rather than making assumptions.
-"""
-        
-        return prompt
+@dataclass
+class MethodInfo:
+    file_path: str
+    method_name: str
+    class_name: str
+    package_name: str
+    param_types: Tuple[str, ...]
+    start_line: int
+    end_line: int
+    snippet: str
+    calls_made: Set[str]  # Method names this method calls
+    called_by: Set[str]   # Method signatures that call this method
+    contains_keywords: bool
     
-    def create_follow_up_prompt(self, original_field_metadata: Dict[str, Any], java_code_context: str, 
-                               conversation_history: List[Dict], user_question: str) -> str:
-        """Create a follow-up prompt that maintains context while addressing user questions."""
-        
-        prompt = """You are continuing to help generate comprehensive test objectives for an ESF API field.
-
-ORIGINAL FIELD METADATA:
-"""
-        for key, value in original_field_metadata.items():
-            prompt += f"{key}: {value}\n"
-        
-        if java_code_context:
-            prompt += f"""
-
-ORIGINAL JAVA CODE CONTEXT:
-{java_code_context}
-"""
-        
-        prompt += """
-
-CONVERSATION HISTORY:
-"""
-        for turn in conversation_history[-6:]:  # Keep last 6 turns for context
-            role = turn.get('role', 'unknown')
-            content = turn.get('content', '')
-            prompt += f"{role.upper()}: {content}\n"
-        
-        prompt += f"""
-
-USER'S CURRENT QUESTION/REQUEST:
-{user_question}
-
-INSTRUCTIONS:
-1. Address the user's specific question/request
-2. Continue to base responses ONLY on provided metadata and code
-3. If generating new test objectives, use the same tab-separated format
-4. If you still need clarification, ask specific questions
-5. Do not make assumptions about validation rules not shown in the code
-
-RESPONSE:
-"""
-        
-        return prompt
+    def get_full_signature(self) -> str:
+        """Get full method signature including class"""
+        return f"{self.class_name}.{self.method_name}({','.join(self.param_types)})"
     
-    def analyze_code_for_validation_patterns(self, java_code_context: str) -> Dict[str, List[str]]:
-        """Analyze Java code to identify common validation patterns."""
-        
-        analysis_prompt = f"""Analyze the following Java code and identify validation patterns. 
-Return your analysis in JSON format with these categories:
+    def get_qualified_name(self) -> str:
+        """Get fully qualified method name"""
+        package_prefix = f"{self.package_name}." if self.package_name else ""
+        return f"{package_prefix}{self.class_name}.{self.method_name}"
 
-{{
-    "data_type_validations": ["list of data type checks found"],
-    "length_validations": ["list of length/size validations found"],
-    "format_validations": ["list of format/pattern validations found"],
-    "null_empty_checks": ["list of null/empty checks found"],
-    "business_rules": ["list of business logic rules found"],
-    "error_conditions": ["list of error conditions handled"],
-    "success_conditions": ["list of success scenarios identified"]
-}}
-
-Java Code:
-{java_code_context}
-
-Provide ONLY the JSON response with actual validation patterns found in the code. 
-If a category has no patterns found, use an empty list.
-"""
-        
-        try:
-            response = self.client.chat_completion(analysis_prompt)
-            content = response.choices[0].message.content.strip()
+def extract_java_code_blocks_with_cross_references(
+    src_dir: str, 
+    keywords: List[str], 
+    max_depth: int = 2,
+    include_callers: bool = True,
+    include_callees: bool = True
+) -> Dict[str, List[str]]:
+    """
+    Enhanced Java code extractor that traces method calls across files.
+    
+    Args:
+        src_dir: Source directory to scan
+        keywords: Keywords to search for
+        max_depth: Maximum depth for call tracing (1 = direct calls only, 2 = calls to calls, etc.)
+        include_callers: Whether to include methods that call the keyword methods
+        include_callees: Whether to include methods called by the keyword methods
+    """
+    
+    print(f"[INFO] Starting cross-file analysis with max_depth={max_depth}")
+    
+    # Phase 1: Parse all Java files and build method registry
+    all_methods = {}  # signature -> MethodInfo
+    file_to_methods = defaultdict(list)  # file -> list of method signatures
+    method_calls_map = defaultdict(set)  # caller_sig -> set of called_method_names
+    
+    java_files = []
+    for root, dirs, files in os.walk(src_dir):
+        for file in files:
+            if file.endswith(".java"):
+                java_files.append(os.path.join(root, file))
+    
+    print(f"[INFO] Found {len(java_files)} Java files to analyze")
+    
+    # Parse all files first
+    for file_path in java_files:
+        methods = parse_java_file(file_path, keywords)
+        for method in methods:
+            sig = method.get_full_signature()
+            all_methods[sig] = method
+            file_to_methods[file_path].append(sig)
+    
+    print(f"[INFO] Parsed {len(all_methods)} total methods")
+    
+    # Phase 2: Build call relationships
+    for method_info in all_methods.values():
+        for called_method in method_info.calls_made:
+            # Find matching methods by name (simple matching)
+            for other_sig, other_method in all_methods.items():
+                if other_method.method_name == called_method:
+                    method_calls_map[method_info.get_full_signature()].add(other_sig)
+                    all_methods[other_sig].called_by.add(method_info.get_full_signature())
+    
+    # Phase 3: Find seed methods (containing keywords)
+    seed_methods = set()
+    for method_info in all_methods.values():
+        if method_info.contains_keywords:
+            seed_methods.add(method_info.get_full_signature())
+    
+    print(f"[INFO] Found {len(seed_methods)} seed methods containing keywords")
+    
+    # Phase 4: Trace relationships to specified depth
+    relevant_methods = set(seed_methods)
+    
+    if include_callers or include_callees:
+        for depth in range(1, max_depth + 1):
+            new_methods = set()
             
-            # Try to extract JSON from the response
-            json_start = content.find('{')
-            json_end = content.rfind('}') + 1
-            if json_start >= 0 and json_end > json_start:
-                json_str = content[json_start:json_end]
-                return json.loads(json_str)
-        except Exception as e:
-            print(f"[DEBUG] Could not analyze code patterns: {e}")
-        
-        return {
-            "data_type_validations": [],
-            "length_validations": [],
-            "format_validations": [],
-            "null_empty_checks": [],
-            "business_rules": [],
-            "error_conditions": [],
-            "success_conditions": []
-        }
+            for method_sig in list(relevant_methods):
+                method_info = all_methods.get(method_sig)
+                if not method_info:
+                    continue
+                
+                # Add callers (methods that call this method)
+                if include_callers:
+                    for caller_sig in method_info.called_by:
+                        if caller_sig not in relevant_methods:
+                            new_methods.add(caller_sig)
+                
+                # Add callees (methods called by this method)
+                if include_callees:
+                    for called_sig in method_calls_map.get(method_sig, set()):
+                        if called_sig not in relevant_methods:
+                            new_methods.add(called_sig)
+            
+            relevant_methods.update(new_methods)
+            print(f"[INFO] Depth {depth}: Added {len(new_methods)} related methods")
+            
+            if not new_methods:  # No new methods found, can stop early
+                break
     
-    def generate_test_categories_prompt(self, field_metadata: Dict[str, Any], 
-                                      validation_patterns: Dict[str, List[str]]) -> str:
-        """Generate a prompt to create test categories based on validation patterns."""
-        
-        prompt = f"""Based on the field metadata and validation patterns identified in the Java code, 
-suggest comprehensive test categories that should be covered.
-
-FIELD METADATA:
-"""
-        for key, value in field_metadata.items():
-            prompt += f"{key}: {value}\n"
-        
-        prompt += f"""
-
-VALIDATION PATTERNS IDENTIFIED:
-{json.dumps(validation_patterns, indent=2)}
-
-Generate a list of test categories that should be covered for this field, such as:
-- Positive validation tests
-- Negative validation tests  
-- Boundary condition tests
-- Data type tests
-- Business rule tests
-- Error handling tests
-
-For each category, briefly explain what should be tested based on the patterns found.
-Respond in a structured format that can guide comprehensive test case generation.
-"""
-        
-        return prompt
-
-def main():
-    # Load FiservAI credentials from environment
-    API_KEY = os.getenv("API_KEY")
-    API_SECRET = os.getenv("API_SECRET")
-    BASE_URL = os.getenv("BASE_URL")
+    print(f"[INFO] Total relevant methods after tracing: {len(relevant_methods)}")
     
-    if not all([API_KEY, API_SECRET, BASE_URL]):
-        print("Error: Missing required environment variables (API_KEY, API_SECRET, BASE_URL)")
-        return
+    # Phase 5: Organize results by file
+    results = {}
+    method_categories = {
+        'seed': [],
+        'callers': [],
+        'callees': []
+    }
     
-    generator = TestObjectiveGenerator(API_KEY, API_SECRET, BASE_URL)
+    for method_sig in relevant_methods:
+        method_info = all_methods.get(method_sig)
+        if not method_info:
+            continue
+        
+        file_path = method_info.file_path
+        if file_path not in results:
+            results[file_path] = []
+        
+        # Categorize the method
+        category = "seed" if method_sig in seed_methods else "related"
+        if method_sig not in seed_methods:
+            # Determine if it's a caller or callee
+            is_caller = any(seed_sig in method_info.calls_made for seed_sig in seed_methods)
+            is_callee = any(method_sig in method_calls_map.get(seed_sig, set()) for seed_sig in seed_methods)
+            
+            if is_caller and is_callee:
+                category = "caller_and_callee"
+            elif is_caller:
+                category = "caller"
+            elif is_callee:
+                category = "callee"
+            else:
+                category = "indirectly_related"
+        
+        # Create annotated snippet
+        header = f"// [{category.upper()}] Method: {method_info.get_qualified_name()}"
+        if method_info.contains_keywords:
+            header += " [CONTAINS KEYWORDS]"
+        
+        annotated_snippet = f"{header}\n// File: {file_path}\n{method_info.snippet}"
+        results[file_path].append(annotated_snippet)
     
-    # Get field metadata
-    hardcoded_field = "PartyRec/PersonPartyInfo/PersonData/Contact/PostAddr/PostalCode"
-    fields_metadata = get_xpath_fields(
-        "PartyInq-PRM.xlsm",
-        with_metadata=True,
-        target_xpath=hardcoded_field
+    return results
+
+def parse_java_file(file_path: str, keywords: List[str]) -> List[MethodInfo]:
+    """Parse a single Java file and extract method information."""
+    
+    try:
+        with open(file_path, encoding="utf-8", errors="ignore") as f:
+            code = f.read()
+    except Exception as e:
+        print(f"[WARNING] Could not read {file_path}: {e}")
+        return []
+    
+    try:
+        tree = javalang.parse.parse(code)
+    except Exception as e:
+        print(f"[WARNING] Could not parse {file_path}: {e}")
+        return []
+    
+    code_lines = code.splitlines()
+    methods = []
+    
+    # Extract package name
+    package_name = ""
+    if tree.package:
+        package_name = tree.package.name
+    
+    # Find class names
+    class_names = []
+    for path, node in tree.filter(javalang.tree.ClassDeclaration):
+        class_names.append(node.name)
+    
+    # If no classes found, use filename
+    if not class_names:
+        class_names = [os.path.splitext(os.path.basename(file_path))[0]]
+    
+    # Extract methods
+    for path, node in tree.filter(javalang.tree.MethodDeclaration):
+        if not hasattr(node, 'position') or node.position is None:
+            continue
+        
+        # Find the class this method belongs to
+        class_name = class_names[0]  # Default to first class
+        for path_element in path:
+            if isinstance(path_element, javalang.tree.ClassDeclaration):
+                class_name = path_element.name
+                break
+        
+        method_name = node.name
+        param_types = tuple(
+            p.type.name if hasattr(p.type, 'name') else str(p.type) 
+            for p in getattr(node, 'parameters', [])
+        )
+        
+        start_line = node.position.line - 1
+        end_line = find_method_end(code_lines, start_line)
+        
+        snippet = "\n".join(code_lines[start_line:end_line + 1])
+        
+        # Find method calls in this method
+        calls_made = extract_method_calls(snippet)
+        
+        # Check if method contains keywords
+        contains_keywords = contains_relevant_keywords(snippet, keywords)
+        
+        method_info = MethodInfo(
+            file_path=file_path,
+            method_name=method_name,
+            class_name=class_name,
+            package_name=package_name,
+            param_types=param_types,
+            start_line=start_line,
+            end_line=end_line,
+            snippet=snippet,
+            calls_made=calls_made,
+            called_by=set(),
+            contains_keywords=contains_keywords
+        )
+        
+        methods.append(method_info)
+    
+    return methods
+
+def find_method_end(code_lines: List[str], start_line: int) -> int:
+    """Find the end line of a method by tracking brace balance."""
+    brace_count = 0
+    in_method_body = False
+    
+    for i in range(start_line, len(code_lines)):
+        line = code_lines[i].strip()
+        
+        if not line or line.startswith('//') or line.startswith('/*') or line.startswith('*'):
+            continue
+        
+        for char in line:
+            if char == '{':
+                brace_count += 1
+                in_method_body = True
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0 and in_method_body:
+                    return i
+    
+    return len(code_lines) - 1
+
+def extract_method_calls(snippet: str) -> Set[str]:
+    """Extract method calls from a code snippet."""
+    # Simple regex to find method calls - this could be enhanced
+    calls = set()
+    
+    # Pattern for method calls: methodName( or object.methodName(
+    patterns = [
+        r'\b([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',  # Direct method calls
+        r'\.([a-zA-Z_][a-zA-Z0-9_]*)\s*\(',  # Method calls on objects
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, snippet)
+        calls.update(matches)
+    
+    # Filter out common keywords and constructors
+    filtered_calls = set()
+    keywords_to_ignore = {'if', 'while', 'for', 'switch', 'catch', 'synchronized', 'return'}
+    
+    for call in calls:
+        if (call not in keywords_to_ignore and 
+            not call[0].isupper() and  # Likely not a constructor
+            len(call) > 1):
+            filtered_calls.add(call)
+    
+    return filtered_calls
+
+def contains_relevant_keywords(snippet: str, keywords: List[str]) -> bool:
+    """Check if snippet contains keywords, excluding comments and annotations."""
+    lines = snippet.split('\n')
+    
+    for line in lines:
+        stripped = line.strip()
+        
+        if (stripped.startswith('@') or 
+            stripped.startswith('//') or 
+            stripped.startswith('/*') or 
+            stripped.startswith('*')):
+            continue
+        
+        if any(kw.lower() in stripped.lower() for kw in keywords):
+            return True
+    
+    return False
+
+# Wrapper function to maintain compatibility with existing code
+def extract_java_code_blocks(src_dir: str, keywords: List[str]) -> Dict[str, List[str]]:
+    """
+    Original function signature maintained for backward compatibility.
+    This version includes cross-file analysis with default settings.
+    """
+    return extract_java_code_blocks_with_cross_references(
+        src_dir=src_dir,
+        keywords=keywords,
+        max_depth=2,
+        include_callers=True,
+        include_callees=True
+    )
+
+# Example usage with different configurations
+if __name__ == "__main__":
+    keywords = ["PostalCode", "validateAddress"]
+    src_directory = "/path/to/your/java/source"
+    
+    print("=== BASIC EXTRACTION (keyword methods only) ===")
+    basic_results = extract_java_code_blocks_with_cross_references(
+        src_directory, keywords, max_depth=0
     )
     
-    if not fields_metadata:
-        print(f"Field '{hardcoded_field}' not found in mapping sheet.")
-        return
+    print("=== WITH CALLERS AND CALLEES (depth 2) ===")
+    full_results = extract_java_code_blocks_with_cross_references(
+        src_directory, keywords, max_depth=2, include_callers=True, include_callees=True
+    )
     
-    field = fields_metadata[0]
-    print(f"[INFO] Field metadata loaded: {field.get('field_name', 'Unknown')}")
+    print("=== ONLY CALLERS (methods that call keyword methods) ===")
+    caller_results = extract_java_code_blocks_with_cross_references(
+        src_directory, keywords, max_depth=1, include_callers=True, include_callees=False
+    )
     
-    # Get Java source directory
-    src_dir = input("Enter path to Java source directory: ").strip()
-    if not os.path.isdir(src_dir):
-        print(f"Source directory '{src_dir}' does not exist.")
-        return
-    
-    print(f"[INFO] Analyzing Java source directory: {src_dir}")
-    
-    # Extract relevant Java code
-    field_last = hardcoded_field.split('/')[-1]
-    field_keywords = [field_last]
-    
-    backend_xpath = field.get('backend_xpath')
-    if backend_xpath and isinstance(backend_xpath, str):
-        backend_segments = [seg for seg in backend_xpath.split('/') if seg]
-        backend_last = backend_segments[-1] if backend_segments else None
-        if backend_last:
-            field_keywords.append(backend_last)
-    
-    print(f"[INFO] Searching for keywords: {field_keywords}")
-    
-    java_code_blocks = extract_java_code_blocks(src_dir, field_keywords)
-    
-    # Combine all code context
-    code_context = ""
-    code_blocks_txt = ""
-    total_methods = 0
-    
-    for file, snippets in java_code_blocks.items():
-        total_methods += len(snippets)
-        for snip in snippets:
-            block = f"\nFile: {file}\n--- Relevant Method ---\n{snip}\n"
-            code_context += block
-            code_blocks_txt += block
-    
-    print(f"[INFO] Found {len(java_code_blocks)} files with {total_methods} relevant methods")
-    
-    # Save code blocks to file
-    output_txt_path = os.path.join(os.getcwd(), "java_code_blocks_found.txt")
-    try:
-        with open(output_txt_path, "w", encoding="utf-8") as f:
-            f.write(code_blocks_txt)
-        print(f"[INFO] Java code blocks saved to: {output_txt_path}")
-    except Exception as e:
-        print(f"[ERROR] Could not write code blocks to file: {e}")
-    
-    # Analyze validation patterns in the code
-    print("[INFO] Analyzing validation patterns in Java code...")
-    validation_patterns = generator.analyze_code_for_validation_patterns(code_context)
-    
-    print("\n[INFO] Validation patterns identified:")
-    for category, patterns in validation_patterns.items():
-        if patterns:
-            print(f"  {category}: {len(patterns)} patterns found")
-    
-    # Initialize conversation manager
-    convo_mgr = SimpleConversationManager(50)
-    
-    print("\n" + "="*80)
-    print("COMPREHENSIVE TEST OBJECTIVE GENERATOR")
-    print("Commands: 'analyze' - analyze code patterns, 'generate' - create test objectives,")
-    print("         'categories' - suggest test categories, 'clear' - reset, 'exit' - quit")
-    print("="*80)
-    
-    # Generate initial comprehensive test objectives
-    print("\n[INFO] Generating initial comprehensive test objectives...\n")
-    
-    try:
-        initial_prompt = generator.create_comprehensive_prompt(field, code_context)
-        response = generator.client.chat_completion(initial_prompt)
-        content = response.choices[0].message.content.strip()
-        
-        print("AI GENERATED TEST OBJECTIVES:")
-        print("-" * 60)
-        print(content)
-        print("-" * 60)
-        
-        convo_mgr.add_turn("[initial_generation]", content)
-        
-    except Exception as e:
-        print(f"[ERROR] Failed to generate initial test objectives: {e}")
-        return
-    
-    # Interactive session
-    while True:
-        user_input = input("\nYour input/question: ").strip()
-        
-        if user_input.lower() == "exit":
-            print("Exiting test objective generator.")
-            break
-            
-        if user_input.lower() == "clear":
-            convo_mgr.clear()
-            print("Chat history cleared.")
-            continue
-            
-        if user_input.lower() == "analyze":
-            print("\nVALIDATION PATTERNS ANALYSIS:")
-            print(json.dumps(validation_patterns, indent=2))
-            continue
-            
-        if user_input.lower() == "generate":
-            # Regenerate comprehensive test objectives
-            try:
-                prompt = generator.create_comprehensive_prompt(field, code_context)
-                response = generator.client.chat_completion(prompt)
-                content = response.choices[0].message.content.strip()
-                
-                print("\nREGENERATED TEST OBJECTIVES:")
-                print("-" * 60)
-                print(content)
-                print("-" * 60)
-                
-                convo_mgr.add_turn("generate", content)
-                
-            except Exception as e:
-                print(f"[ERROR] Failed to regenerate test objectives: {e}")
-            continue
-            
-        if user_input.lower() == "categories":
-            try:
-                categories_prompt = generator.generate_test_categories_prompt(field, validation_patterns)
-                response = generator.client.chat_completion(categories_prompt)
-                content = response.choices[0].message.content.strip()
-                
-                print("\nSUGGESTED TEST CATEGORIES:")
-                print("-" * 60)
-                print(content)
-                print("-" * 60)
-                
-                convo_mgr.add_turn("categories", content)
-                
-            except Exception as e:
-                print(f"[ERROR] Failed to generate test categories: {e}")
-            continue
-        
-        if not user_input:
-            continue
-            
-        # Handle regular conversation
-        try:
-            conversation = convo_mgr.get_conversation()
-            follow_up_prompt = generator.create_follow_up_prompt(
-                field, code_context, conversation, user_input
-            )
-            
-            response = generator.client.chat_completion(follow_up_prompt)
-            content = response.choices[0].message.content.strip()
-            
-            print(f"\nAI Response:")
-            print("-" * 40)
-            print(content)
-            print("-" * 40)
-            
-            convo_mgr.add_turn(user_input, content)
-            
-        except Exception as e:
-            print(f"[ERROR] Failed to process input: {e}")
-    
-    # Save final conversation to file
-    try:
-        conversation_file = os.path.join(os.getcwd(), "test_objectives_conversation.json")
-        final_conversation = convo_mgr.get_conversation()
-        
-        with open(conversation_file, "w", encoding="utf-8") as f:
-            json.dump({
-                "field_metadata": field,
-                "validation_patterns": validation_patterns,
-                "conversation": final_conversation
-            }, f, indent=2)
-        
-        print(f"\n[INFO] Full conversation saved to: {conversation_file}")
-        
-    except Exception as e:
-        print(f"[ERROR] Could not save conversation: {e}")
-
-if __name__ == "__main__":
-    main()
+    for file_path, methods in full_results.items():
+        print(f"\n=== File: {file_path} ===")
+        for method in methods:
+            print(f"\n{method}")
