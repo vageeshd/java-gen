@@ -1,0 +1,561 @@
+# modes/chat_mode.py
+import re
+from difflib import get_close_matches, SequenceMatcher
+from typing import List, Tuple, Optional
+
+# Make sure these imports match your project structure
+from fiserv_ai_utils import SimpleConversationManager
+from core.get_xpath_fields import get_xpath_fields  # if needed elsewhere
+from core.test_objective_core import TestObjectiveGeneratorCore
+from core.testcase_manager import TestCaseManager
+from import_openpyxl import FieldMetadataLoader  # type: ignore
+
+# -----------------------
+# Intent parser & session
+# -----------------------
+
+class UserIntentParser:
+    """Parse user intent with fuzzy matching and conversational understanding"""
+    def __init__(self):
+        self.intent_patterns = {
+            'select_field': [
+                r'select (.+)', r'choose (.+)', r'pick (.+)', r'use (.+)',
+                r'work on (.+)', r'set field (.+)', r'field (.+)'
+            ],
+            'search_field': [
+                r'search (.+)', r'find (.+)', r'look for (.+)', 
+                r'show (.+) fields', r'(.+) fields?'
+            ],
+            'list_fields': [
+                r'list', r'show all', r'all fields', r'what fields', 
+                r'available', r'options'
+            ],
+            'generate': [
+                r'generate', r'create', r'make', r'build', r'start',
+                r'generate tests?', r'create tests?', r'make tests?'
+            ],
+            'regenerate': [
+                r'regenerate', r'more', r'again', r'additional', 
+                r'generate more', r'create more', r'more tests?'
+            ],
+            'improve': [
+                r'improve (.+)', r'better (.+)', r'enhance (.+)',
+                r'add (.+)', r'include (.+)', r'need (.+)'
+            ],
+            'approve': [
+                r'approve (.+)', r'accept (.+)', r'yes (.+)', r'good (.+)',
+                r'keep (.+)', r'ok (.+)', r'fine (.+)', r'approve all'
+            ],
+            'reject': [
+                r'reject (.+)', r'no (.+)', r'bad (.+)', r'remove (.+)',
+                r'delete (.+)', r'discard (.+)', r'not (.+)'
+            ],
+            'show_pending': [
+                r'show', r'display', r'review', r'see', r'what',
+                r'pending', r'current', r'generated'
+            ],
+            'show_all': [
+                r'show all', r'all cases', r'everything', r'status',
+                r'summary', r'what do we have'
+            ],
+            'export': [
+                r'export', r'save', r'download', r'file', r'excel',
+                r'finish', r'done', r'complete'
+            ],
+            'help': [
+                r'help', r'what can', r'commands', r'how', r'instructions'
+            ],
+            'exit': [
+                r'exit', r'quit', r'bye', r'goodbye', r'stop', r'end'
+            ]
+        }
+        self.tc_id_pattern = r'(TC_\d{3})'
+
+    def parse_intent(self, user_input: str) -> Tuple[str, dict]:
+        """Parse user intent and extract parameters"""
+        text = user_input.strip()
+        if not text:
+            return 'unknown', {}
+
+        low = text.lower()
+
+        # Extract test case IDs (TC_001 style)
+        tc_ids = re.findall(self.tc_id_pattern, text.upper())
+
+        # Try explicit pattern matches
+        for intent, patterns in self.intent_patterns.items():
+            for pattern in patterns:
+                m = re.search(pattern, low)
+                if m:
+                    params = {'tc_ids': tc_ids}
+                    # Group capture if present
+                    if m.groups():
+                        target = m.group(1).strip()
+                        params['target'] = target
+                    return intent, params
+
+        # Fuzzy fallback
+        fuzzy = self._fuzzy_match_intent(low)
+        if fuzzy:
+            return fuzzy, {'tc_ids': tc_ids, 'target': text}
+
+        return 'unknown', {'raw_input': text, 'tc_ids': tc_ids}
+
+    def _fuzzy_match_intent(self, user_input: str) -> Optional[str]:
+        """Use simple fuzzy matching for intents"""
+        intent_keywords = {
+            'generate': ['generate', 'create', 'make', 'build'],
+            'approve': ['approve', 'accept', 'yes', 'good', 'keep'],
+            'reject': ['reject', 'no', 'bad', 'remove', 'delete'],
+            'export': ['export', 'save', 'download', 'excel'],
+            'show_pending': ['show', 'display', 'review', 'see'],
+            'help': ['help', 'commands', 'how'],
+            'exit': ['exit', 'quit', 'bye', 'stop']
+        }
+        best = None
+        best_score = 0.6
+        for intent, keys in intent_keywords.items():
+            for k in keys:
+                score = SequenceMatcher(None, user_input, k).ratio()
+                if score > best_score:
+                    best_score = score
+                    best = intent
+        return best
+
+# -----------------------
+# Conversational session
+# -----------------------
+
+class ConversationalSession:
+    """Manage conversational session with memory and context"""
+    def __init__(self, conversation_manager: SimpleConversationManager):
+        self.convo_mgr = conversation_manager
+        self.current_field: Optional[str] = None  # selected field xpath
+        self.current_field_metadata: Optional[dict] = None
+        self.session_context = {
+            'generated_count': 0,
+            'approved_count': 0,
+            'rejected_count': 0,
+            'last_action': None,
+            'help_shown': False
+        }
+
+    def add_interaction(self, user_input: str, system_response: str, action: Optional[str] = None):
+        """Add interaction to conversation history"""
+        try:
+            self.convo_mgr.add_turn(user_input, system_response)
+        except Exception:
+            # If conversation manager API differs, silently continue
+            pass
+        if action:
+            self.session_context['last_action'] = action
+
+    def get_context_for_generation(self) -> str:
+        """Get conversation context for AI generation"""
+        context_lines = []
+        if self.current_field_metadata:
+            name = self.current_field_metadata.get('field_name') or self.current_field_metadata.get('xpath')
+            context_lines.append(f"Current field: {name}")
+            context_lines.append(f"Field metadata: {self.current_field_metadata}")
+        # Pull last few turns
+        try:
+            conv = self.convo_mgr.get_conversation() or []
+            if conv:
+                context_lines.append("Recent conversation:")
+                for turn in conv[-6:]:
+                    role = turn.get('role', 'user')
+                    content = turn.get('content', '')
+                    snippet = content if len(content) < 200 else content[:197] + "..."
+                    context_lines.append(f"{role.upper()}: {snippet}")
+        except Exception:
+            pass
+        return "\n".join(context_lines)
+
+    def update_stats(self, key: str, delta: int = 1):
+        if key in self.session_context:
+            try:
+                self.session_context[key] += delta
+            except Exception:
+                self.session_context[key] = delta
+
+# -----------------------
+# Utility helpers
+# -----------------------
+
+def find_field_fuzzy(target: str, field_list: List[str]) -> Optional[str]:
+    """Fuzzy match a target against the list of xpaths (returns full xpath)"""
+    if not target:
+        return None
+    # Try exact last-segment match
+    for f in field_list:
+        last = f.split('/')[-1]
+        if last.lower() == target.lower() or f.lower() == target.lower():
+            return f
+    # Try substring match
+    substr = [f for f in field_list if target.lower() in f.lower() or target.lower() in f.split('/')[-1].lower()]
+    if len(substr) == 1:
+        return substr[0]
+    if substr:
+        # return best close match by similarity on last segment
+        candidates = [s.split('/')[-1] for s in substr]
+        best = get_close_matches(target, candidates, n=1, cutoff=0.5)
+        if best:
+            # map back to full xpath
+            for s in substr:
+                if s.split('/')[-1] == best[0]:
+                    return s
+    # fallback using difflib across all field names
+    names = [f.split('/')[-1] for f in field_list]
+    close = get_close_matches(target, names, n=1, cutoff=0.5)
+    if close:
+        idx = names.index(close[0])
+        return field_list[idx]
+    return None
+
+def show_help() -> str:
+    return (
+        "Help — you can say things naturally. Examples:\n"
+        " • search address\n"
+        " • select PostalCode\n"
+        " • generate test cases\n"
+        " • add 2 more negative cases\n"
+        " • reject TC_003\n"
+        " • approve TC_001 TC_002\n"
+        " • save to excel\n"
+        " • exit\n"
+    )
+
+def show_quick_help() -> str:
+    return "Quick: 'select <field>', 'generate', 'add more', 'approve TC_001', 'reject TC_002', 'save to excel', 'exit'"
+
+# -----------------------
+# Handlers that complete missing functionality
+# -----------------------
+
+def handle_generate(generator: TestObjectiveGeneratorCore, session: ConversationalSession, is_regenerate: bool = False) -> Tuple[str, bool]:
+    """Handle test case generation with conversation context"""
+    if not session.current_field_metadata:
+        return "I need you to select a field first (e.g. 'select PostalCode').", False
+
+    field_meta = session.current_field_metadata
+    field_name = field_meta.get('field_name') or field_meta.get('xpath', 'unknown')
+
+    try:
+        conversation_context = session.get_context_for_generation()
+        # prefer method that accepts context if available
+        if hasattr(generator, "generate_for_field_with_context"):
+            ok = generator.generate_for_field_with_context(field_meta, conversation_context)
+            success = bool(ok)
+        else:
+            # fallback to existing generate_for_field
+            out = generator.generate_for_field(field_meta)
+            # generator.generate_for_field might return bool or created cases; treat both
+            success = bool(out)
+        if success:
+            session.update_stats('generated_count', 1)
+            # Show last few pending cases
+            pending = []
+            try:
+                pending = generator.test_manager.get_pending_cases()
+            except Exception:
+                pending = getattr(generator.test_manager, "test_cases", [])[-10:]
+            recents = pending[-3:] if pending else []
+            msg = f"Generated test cases for {field_name}.\nRecent:\n"
+            for c in recents:
+                tid = c.get("Test Case ID", "N/A")
+                obj = c.get("Test Objective", "")[:120]
+                typ = c.get("Type of Validation", "")
+                msg += f" • {tid}: {obj} ({typ})\n"
+            msg += "You can 'approve TC_001' or 'reject TC_002' or say 'add 2 more negative cases'."
+            return msg, True
+        else:
+            return "Generation did not produce results. Try again or try 'regenerate'.", False
+    except Exception as e:
+        return f"Error while generating: {str(e)}", False
+
+def handle_improve(generator: TestObjectiveGeneratorCore, session: ConversationalSession, feedback: str) -> str:
+    """Handle improvement/refinement requests"""
+    if not session.current_field_metadata:
+        return "I need a selected field to improve test cases for."
+
+    field_meta = session.current_field_metadata
+    field_name = field_meta.get('field_name') or field_meta.get('xpath', 'unknown')
+
+    # collect existing cases for this field
+    existing = []
+    try:
+        # try a manager helper first
+        existing = generator.test_manager.get_cases_for_field(field_name)
+    except Exception:
+        # fallback: search the list
+        all_cases = getattr(generator.test_manager, "test_cases", [])
+        existing = [c for c in all_cases if c.get('Mapping Correlation','').endswith(field_name) or c.get('Request/Response Field','').endswith(field_name)]
+
+    try:
+        if hasattr(generator, "refine_test_cases"):
+            refined = generator.refine_test_cases(field_name, existing, feedback)
+        else:
+            # fallback: call generate_for_field_with_context and pass feedback via context
+            context = session.get_context_for_generation() + "\nUser feedback: " + feedback
+            if hasattr(generator, "generate_for_field_with_context"):
+                _ = generator.generate_for_field_with_context(field_meta, context)
+                refined = getattr(generator.test_manager, "get_pending_cases", lambda: [])()
+            else:
+                refined = existing  # no change possible
+        # update test manager
+        try:
+            generator.test_manager.update_cases(field_name, refined)
+        except Exception:
+            # fallback: remove all cases for field and append refined
+            all_cases = getattr(generator.test_manager, "test_cases", [])
+            kept = [c for c in all_cases if not (c.get('Mapping Correlation','').endswith(field_name) or c.get('Request/Response Field','').endswith(field_name))]
+            setattr(generator.test_manager, "test_cases", kept + (refined if isinstance(refined, list) else []))
+        session.update_stats('generated_count', 1)
+        return f"Improved test cases for {field_name} based on your feedback."
+    except Exception as e:
+        return f"Could not improve cases: {str(e)}"
+
+def handle_approve_all(generator: TestObjectiveGeneratorCore, session: ConversationalSession) -> str:
+    """Approve everything pending for the current field (or globally)"""
+    field_name = session.current_field_metadata.get('field_name') if session.current_field_metadata else None
+    all_cases = getattr(generator.test_manager, "test_cases", [])
+    count = 0
+    for case in all_cases:
+        # mark as approved
+        if field_name:
+            # approximate match on mapping / field name
+            if field_name and (field_name in str(case.get('Mapping Correlation','')) or field_name in str(case.get('Request/Response Field','')) or case.get('Mapping Correlation','').endswith(field_name)):
+                case['Status'] = 'APPROVED'
+                count += 1
+        else:
+            case['Status'] = 'APPROVED'
+            count += 1
+    session.update_stats('approved_count', count)
+    return f"Approved {count} test cases."
+
+def handle_approve_specific(generator: TestObjectiveGeneratorCore, session: ConversationalSession, tc_ids: List[str]) -> str:
+    """Approve specific test case ids"""
+    all_cases = getattr(generator.test_manager, "test_cases", [])
+    found = 0
+    for tid in tc_ids:
+        for case in all_cases:
+            if case.get('Test Case ID', '').upper() == tid.upper():
+                case['Status'] = 'APPROVED'
+                found += 1
+                break
+    session.update_stats('approved_count', found)
+    return f"Approved {found} specified test cases."
+
+def handle_reject_specific(generator: TestObjectiveGeneratorCore, session: ConversationalSession, tc_ids: List[str]) -> str:
+    """Reject (remove) specific test case ids"""
+    all_cases = getattr(generator.test_manager, "test_cases", [])
+    before = len(all_cases)
+    remaining = [c for c in all_cases if c.get('Test Case ID','').upper() not in [t.upper() for t in tc_ids]]
+    removed = before - len(remaining)
+    setattr(generator.test_manager, "test_cases", remaining)
+    session.update_stats('rejected_count', removed)
+    return f"Removed {removed} test cases."
+
+def handle_show_pending(generator: TestObjectiveGeneratorCore) -> str:
+    """Return a brief summary of pending (non-approved) test cases"""
+    all_cases = getattr(generator.test_manager, "test_cases", [])
+    pending = [c for c in all_cases if c.get('Status','').upper() != 'APPROVED']
+    if not pending:
+        return "No pending test cases (all are approved or none exist)."
+    s = f"Pending test cases: {len(pending)}\n"
+    for c in pending[-5:]:
+        s += f" • {c.get('Test Case ID','N/A')}: {c.get('Test Objective','')[:80]}...\n"
+    return s
+
+def handle_show_all(generator: TestObjectiveGeneratorCore) -> str:
+    all_cases = getattr(generator.test_manager, "test_cases", [])
+    if not all_cases:
+        return "No test cases currently stored."
+    s = f"Total test cases stored: {len(all_cases)}\n"
+    for c in all_cases[-10:]:
+        s += f" • {c.get('Test Case ID','N/A')} [{c.get('Status','PENDING')}]: {c.get('Test Objective','')[:80]}...\n"
+    return s
+
+def handle_export(generator: TestObjectiveGeneratorCore, out_file: str = "generated_test_cases.xlsx") -> str:
+    """Export current cases to Excel and return user message"""
+    try:
+        # try manager export method
+        path = out_file
+        try:
+            # some managers return file path; others just write file
+            res = generator.test_manager.export_to_excel(path)
+            # if export_to_excel returns a path, use it
+            if isinstance(res, str) and res:
+                path = res
+        except TypeError:
+            # older signature may not accept parameter
+            generator.test_manager.export_to_excel(out_file)
+        return f"Exported test cases to {path}."
+    except Exception as e:
+        return f"Export failed: {str(e)}"
+
+def handle_unknown_intent(user_input: str, session: ConversationalSession) -> str:
+    """Fallback conversational reply for unknown intents"""
+    if session.current_field:
+        field_name = session.current_field.split('/')[-1]
+        return f"I didn't catch that. You're working on '{field_name}'. Try: 'generate', 'add more', 'approve TC_001', or 'reject TC_002'."
+    return "I didn't understand that. Try 'search <keyword>' or 'select <field>' or say 'help'."
+
+def handle_exit_flow(generator: TestObjectiveGeneratorCore) -> bool:
+    """On exit, ask to export and save; return True if saved or user declined gracefully"""
+    try:
+        all_cases = getattr(generator.test_manager, "test_cases", [])
+        if not all_cases:
+            print("No test cases generated this session.")
+            return True
+        choice = input("Export generated test cases to Excel? (Y/n): ").strip().lower()
+        if choice in ['', 'y', 'yes']:
+            out_file = input("Output filename (default 'generated_test_cases.xlsx'): ").strip() or "generated_test_cases.xlsx"
+            msg = handle_export(generator, out_file)
+            print(msg)
+            return True
+        else:
+            print("Ok — not exporting. Cases remain in memory.")
+            return True
+    except Exception as e:
+        print(f"Error during exit flow: {e}")
+        return False
+
+# -----------------------
+# Main conversational entry
+# -----------------------
+
+def conversational_interactive_mode(generator: TestObjectiveGeneratorCore, field_loader: FieldMetadataLoader) -> bool:
+    """Conversational interactive mode with memory and natural language"""
+    convo_mgr = SimpleConversationManager(50)  # keep 50 turns
+    intent_parser = UserIntentParser()
+    session = ConversationalSession(convo_mgr)
+
+    print("CONVERSATIONAL TEST CASE GENERATOR — say 'help' for examples.\n")
+
+    # load available fields
+    try:
+        field_set = field_loader.get_available_fields()
+        field_list = sorted(list(field_set))
+        print(f"Loaded {len(field_list)} fields from mapping.")
+    except Exception as e:
+        print(f"Could not load fields: {e}")
+        return False
+
+    while True:
+        # show short status
+        if session.current_field:
+            name = session.current_field.split('/')[-1]
+            print(f"\n[Context] Working on: {name}")
+
+        user_input = input("\nYou: ").strip()
+        if not user_input:
+            continue
+
+        intent, params = intent_parser.parse_intent(user_input)
+
+        if intent == 'exit':
+            print("Goodbye.")
+            session.add_interaction(user_input, "exit", 'exit')
+            break
+
+        if intent == 'help':
+            resp = show_help()
+            print(resp)
+            session.add_interaction(user_input, resp, 'help')
+            continue
+
+        if intent == 'list_fields':
+            resp = show_quick_help()  # or handle_list_fields if preferred
+            print(resp)
+            session.add_interaction(user_input, resp, 'list')
+            continue
+
+        if intent == 'search_field':
+            target = params.get('target', '')
+            resp = handle_search_fields(target, field_list)
+            print(resp)
+            session.add_interaction(user_input, resp, 'search')
+            continue
+
+        if intent == 'select_field':
+            target = params.get('target', '')
+            sel, resp = handle_select_field(target, field_list, field_loader)
+            print(resp)
+            session.add_interaction(user_input, resp, 'select')
+            if sel:
+                session.current_field = sel
+                try:
+                    session.current_field_metadata = field_loader.get_field_metadata(sel)
+                except Exception:
+                    session.current_field_metadata = None
+            continue
+
+        if intent == 'generate':
+            resp, ok = handle_generate(generator, session)
+            print(resp)
+            session.add_interaction(user_input, resp, 'generate' if ok else 'generate_failed')
+            continue
+
+        if intent == 'regenerate':
+            resp, ok = handle_generate(generator, session, is_regenerate=True)
+            print(resp)
+            session.add_interaction(user_input, resp, 'regenerate' if ok else 'regenerate_failed')
+            continue
+
+        if intent == 'improve':
+            feedback = params.get('target') or user_input
+            resp = handle_improve(generator, session, feedback)
+            print(resp)
+            session.add_interaction(user_input, resp, 'improve')
+            continue
+
+        if intent == 'approve':
+            tc_ids = params.get('tc_ids', [])
+            target = params.get('target', '') or user_input
+            if 'all' in target.lower():
+                resp = handle_approve_all(generator, session)
+            elif tc_ids:
+                resp = handle_approve_specific(generator, session, tc_ids)
+            else:
+                resp = "Please specify test case IDs to approve, e.g. 'approve TC_001' or 'approve all'."
+            print(resp)
+            session.add_interaction(user_input, resp, 'approve')
+            continue
+
+        if intent == 'reject':
+            tc_ids = params.get('tc_ids', [])
+            if tc_ids:
+                resp = handle_reject_specific(generator, session, tc_ids)
+            else:
+                resp = "Please specify which test case(s) to reject, e.g. 'reject TC_002'."
+            print(resp)
+            session.add_interaction(user_input, resp, 'reject')
+            continue
+
+        if intent == 'show_pending':
+            resp = handle_show_pending(generator)
+            print(resp)
+            session.add_interaction(user_input, resp, 'show')
+            continue
+
+        if intent == 'show_all':
+            resp = handle_show_all(generator)
+            print(resp)
+            session.add_interaction(user_input, resp, 'show_all')
+            continue
+
+        if intent == 'export':
+            out = input("Output filename (default 'generated_test_cases.xlsx'): ").strip() or "generated_test_cases.xlsx"
+            resp = handle_export(generator, out)
+            print(resp)
+            session.add_interaction(user_input, resp, 'export')
+            continue
+
+        # Fallback conversational handling
+        resp = handle_unknown_intent(user_input, session)
+        print(resp)
+        session.add_interaction(user_input, resp, 'unknown')
+
+    # on exit ask to save
+    return handle_exit_flow(generator)
