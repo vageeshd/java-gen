@@ -1,0 +1,105 @@
+
+from dataclasses import dataclass, field
+from typing import List, Optional
+import javalang
+
+@dataclass
+class MethodInfo:
+    file_path: str
+    package_name: Optional[str]
+    class_name: Optional[str]
+    method_name: str
+    param_types: List[str] = field(default_factory=list)
+    snippet: str = ""
+    calls_made: List[str] = field(default_factory=list)
+    relevance_score: int = 0
+
+def parse_java_file(file_path: str, primary_keywords: List[str]) -> List[MethodInfo]:
+    """Parse a Java file into MethodInfo objects using javalang"""
+    methods_out = []
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            src = f.read()
+        tree = javalang.parse.parse(src)
+    except Exception:
+        return []
+
+    package = getattr(tree, "package", None)
+    package_name = package.name if package else None
+
+    lines = src.splitlines()
+
+    for _, class_decl in tree.filter(javalang.tree.TypeDeclaration):
+        class_name = getattr(class_decl, "name", None)
+        for method in getattr(class_decl, "methods", []):
+            try:
+                name = method.name
+                # parameters
+                param_types = []
+                for p in method.parameters:
+                    if p.type:
+                        typename = p.type.name
+                        if getattr(p.type, "sub_type", None):
+                            typename += "<" + p.type.sub_type.name + ">"
+                        param_types.append(typename)
+
+                # method calls
+                calls = []
+                for _, inv in method.filter(javalang.tree.MethodInvocation):
+                    if getattr(inv, "member", None):
+                        calls.append(inv.member)
+
+                # extract snippet using position if available
+                start_line = getattr(method, "position", None).line if getattr(method, "position", None) else None
+                snippet = ""
+                if start_line:
+                    snippet_lines = lines[start_line - 1 : start_line + 40]  # grab ~40 lines as context
+                    snippet = "\n".join(snippet_lines)
+                else:
+                    snippet = "/* snippet unavailable */"
+
+                methods_out.append(
+                    MethodInfo(
+                        file_path=file_path,
+                        package_name=package_name,
+                        class_name=class_name,
+                        method_name=name,
+                        param_types=param_types,
+                        snippet=snippet,
+                        calls_made=calls,
+                    )
+                )
+            except Exception:
+                continue
+
+    return methods_out
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def _check_file_for_keywords(file_path: str, keywords: List[str]) -> Optional[str]:
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        if any(kw.lower() in content.lower() for kw in keywords):
+            return file_path
+    except Exception:
+        return None
+    return None
+
+def fast_keyword_filter(src_dir: str, keywords: List[str], max_workers: int = 8) -> List[str]:
+    """Return Java files containing at least one keyword, scanned in parallel"""
+    candidates = []
+    java_files = []
+    for root, _, files in os.walk(src_dir):
+        for file in files:
+            if file.endswith(".java"):
+                java_files.append(os.path.join(root, file))
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_check_file_for_keywords, f, keywords) for f in java_files]
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result:
+                candidates.append(result)
+
+    return candidates
