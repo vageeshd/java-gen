@@ -1,0 +1,253 @@
+# REPLACE your existing generate_for_field() method with this:
+def generate_for_field_with_context(self, field_metadata: dict, conversation_context: str = "") -> bool:
+    """Generate test cases with conversation context for better continuity"""
+    
+    # Validate field data
+    is_valid, error_msg = self._validate_field_data(field_metadata)
+    if not is_valid:
+        print(f"[ERROR] Invalid field data: {error_msg}")
+        return False
+    
+    try:
+        backend_xpath = field_metadata.get("backend_xpath") or ""
+        field_name = field_metadata.get("field_name", "")
+        
+        # Extract keywords safely
+        keywords = []
+        if backend_xpath:
+            last_seg = backend_xpath.split("/")[-1]
+            if last_seg:
+                keywords.append(last_seg)
+        if field_name:
+            keywords.append(field_name)
+        
+        if not keywords:
+            print(f"[WARN] No valid keywords found for field, using generic search")
+            keywords = ["validate", "check"]  # Fallback keywords
+        
+        print(f"[INFO] Extracting Java code for keywords: {keywords}")
+        
+        # Extract Java code with error handling
+        try:
+            snippets = extract_java_code_blocks_with_cross_references(
+                self.src_dir, keywords, max_depth=1,
+                mapping_file_path=self.mapping_file_path,  # Pass mapping file
+                field_metadata=field_metadata              # Pass field metadata
+            )
+            context = trim_code_context(snippets, max_chars=2000,
+                                      mapping_file_path=self.mapping_file_path)
+        except Exception as e:
+            print(f"[WARN] Java extraction failed: {str(e)}, continuing without code context")
+            context = ""
+        
+        # Create enhanced prompt with conversation context
+        context_part = f"""Field metadata and conversation context for test case generation:
+
+FIELD METADATA:
+"""
+        for key, value in field_metadata.items():
+            if value:
+                context_part += f"{key}: {value}\n"
+        
+        if context:
+            context_part += f"""
+
+JAVA CODE CONTEXT:
+{context}"""
+        
+        if conversation_context:
+            context_part += f"""
+
+CONVERSATION CONTEXT:
+{conversation_context}"""
+        
+        question_part = """Generate test cases in EXACTLY 9 tab-separated columns:
+Category | Test Case ID (blank) | Type of Validation | Test Objective | Request/Response Field | Test Steps | Expected Result | Mapping Correlation | Manual/Automation
+
+REQUIREMENTS:
+- Category: Always "Functional"
+- Type of Validation: "Field Validation - Positive", "Field Validation - Negative", "Business Validation - Positive", "Business Validation - Negative"
+- Manual/Automation: "Manual" for business validation, "Automation" for field validation
+- Generate 2-4 test cases covering different validation scenarios
+- Consider the conversation context for continuity
+
+Output ONLY the test case rows, no explanations."""
+
+        formatted_prompt = f"====CONTEXT {context_part} ====QUESTION {question_part}"
+        
+        # Call API with retry
+        output = self._call_api_with_retry(formatted_prompt)
+        
+        if output is None:
+            print(f"[ERROR] Failed to generate test cases for field: {field_name}")
+            self.failed_fields.append(field_name)
+            return False
+        
+        # Parse and store results
+        new_tc_ids = self.test_manager.parse_and_add_test_cases(output, 
+            default_mapping=field_metadata.get('backend_xpath', ''))
+        
+        if new_tc_ids:
+            print(f"[INFO] Generated {len(new_tc_ids)} new test cases")
+            return True
+        else:
+            print(f"[WARN] No test cases parsed from AI response")
+            return False
+        
+    except Exception as e:
+        print(f"[ERROR] Unexpected error processing field {field_metadata.get('field_name', 'unknown')}: {str(e)}")
+        self.failed_fields.append(field_metadata.get('field_name', 'unknown'))
+        return False
+
+# KEEP the old method for backward compatibility:
+def generate_for_field(self, field_metadata: dict) -> bool:
+    """Backward compatibility wrapper"""
+    return self.generate_for_field_with_context(field_metadata)
+
+def generate_with_feedback(self, field_metadata: dict, feedback: str, 
+                          conversation_context: str = "") -> bool:
+    """Generate improved test cases based on user feedback"""
+    
+    try:
+        field_name = field_metadata.get('field_name', 'Unknown')
+        
+        # Get existing test cases for context
+        existing_cases = self.test_manager.get_cases_by_field(field_name) if hasattr(self.test_manager, 'get_cases_by_field') else []
+        
+        context_part = f"""Field metadata and feedback for test case improvement:
+
+FIELD METADATA:
+"""
+        for key, value in field_metadata.items():
+            if value:
+                context_part += f"{key}: {value}\n"
+        
+        if existing_cases:
+            context_part += f"""
+
+EXISTING TEST CASES:
+"""
+            for i, case in enumerate(existing_cases[:3]):  # Show up to 3 existing cases
+                context_part += f"TC_{i+1}: {case.get('Test Objective', 'N/A')}\n"
+        
+        if conversation_context:
+            context_part += f"""
+
+CONVERSATION CONTEXT:
+{conversation_context}"""
+        
+        context_part += f"""
+
+USER FEEDBACK:
+{feedback}"""
+        
+        question_part = """Based on the user feedback, generate 1-2 additional test cases that address the specific requirements mentioned.
+
+Generate in EXACTLY 9 tab-separated columns:
+Category | Test Case ID (blank) | Type of Validation | Test Objective | Request/Response Field | Test Steps | Expected Result | Mapping Correlation | Manual/Automation
+
+Focus on the user's specific feedback and avoid duplicating existing test scenarios.
+Output ONLY the test case rows, no explanations."""
+
+        formatted_prompt = f"====CONTEXT {context_part} ====QUESTION {question_part}"
+        
+        # Call API with retry
+        output = self._call_api_with_retry(formatted_prompt)
+        
+        if output is None:
+            print(f"[ERROR] Failed to generate feedback-based test cases for field: {field_name}")
+            return False
+        
+        # Parse and store results
+        new_tc_ids = self.test_manager.parse_and_add_test_cases(output, 
+            default_mapping=field_metadata.get('backend_xpath', ''))
+        
+        if new_tc_ids:
+            print(f"[INFO] Generated {len(new_tc_ids)} feedback-based test cases")
+            return True
+        else:
+            print(f"[WARN] No feedback-based test cases parsed from AI response")
+            return False
+            
+    except Exception as e:
+        print(f"[ERROR] Error generating feedback-based test cases: {str(e)}")
+        return False
+
+def generate_rule_based_test_cases(self, field_metadata: dict) -> bool:
+    """Generate standard rule-based test cases without user interaction"""
+    
+    field_name = field_metadata.get('field_name', 'Unknown')
+    data_type = field_metadata.get('datatype', '').lower()
+    
+    print(f"[INFO] Generating rule-based test cases for {field_name}")
+    
+    # Determine test case types based on field metadata
+    test_case_types = []
+    
+    # Always include these core tests
+    test_case_types.extend([
+        'Field Validation - Positive',
+        'Field Validation - Negative'
+    ])
+    
+    # Add specific tests based on data type
+    if 'string' in data_type or 'text' in data_type:
+        test_case_types.extend([
+            'Field Validation - Negative'  # For empty/null values
+        ])
+    
+    if 'number' in data_type or 'int' in data_type:
+        test_case_types.extend([
+            'Field Validation - Negative'  # For boundary conditions
+        ])
+    
+    # Add business validation if service notes indicate business rules
+    service_notes = field_metadata.get('service_notes', '').lower()
+    if any(keyword in service_notes for keyword in ['business', 'rule', 'validation', 'required']):
+        test_case_types.append('Business Validation - Positive')
+    
+    context_part = f"""Field metadata for rule-based test case generation:
+
+FIELD METADATA:
+"""
+    for key, value in field_metadata.items():
+        if value:
+            context_part += f"{key}: {value}\n"
+    
+    context_part += f"""
+
+REQUIRED TEST TYPES:
+{', '.join(test_case_types)}"""
+    
+    question_part = f"""Generate exactly {len(test_case_types)} test cases, one for each required test type.
+
+Generate in EXACTLY 9 tab-separated columns:
+Category | Test Case ID (blank) | Type of Validation | Test Objective | Request/Response Field | Test Steps | Expected Result | Mapping Correlation | Manual/Automation
+
+Create comprehensive test cases that cover the essential validation scenarios for this field type.
+Output ONLY the test case rows, no explanations."""
+
+    formatted_prompt = f"====CONTEXT {context_part} ====QUESTION {question_part}"
+    
+    try:
+        # Call API with retry
+        output = self._call_api_with_retry(formatted_prompt)
+        
+        if output is None:
+            print(f"[ERROR] Failed to generate rule-based test cases for field: {field_name}")
+            return False
+        
+        # Parse and store results
+        new_tc_ids = self.test_manager.parse_and_add_test_cases(output, 
+            default_mapping=field_metadata.get('backend_xpath', ''))
+        
+        if new_tc_ids:
+            print(f"[INFO] Generated {len(new_tc_ids)} rule-based test cases")
+            return True
+        else:
+            print(f"[WARN] No rule-based test cases parsed from AI response")
+            return False
+            
+    except Exception as e:
+        print(f"[ERROR] Error generating rule-based test cases: {str(e)}")
+        return False
