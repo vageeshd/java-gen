@@ -1,13 +1,21 @@
-elif intent == 'complete_field':
-    if not session.current_field_metadata:
-        response = "❌ No field is currently selected to complete."
-    else:
-        if generator.is_field_ready_for_completion():
-            completion_result = generator.complete_current_field()
-            field_name = completion_result.get('completed_field', 'Unknown')
-            approved_count = completion_result.get('approved_count', 0)
-            response = f"✅ Completed field {field_name} with {approved_count} approved test cases. You can now export or work on another field."
-        else:
-            response = "❌ Current field needs at least one approved test case before completion."
-    print(f"🤖 Assistant: {response}")
-    session.add_interaction(user_input, response, 'complete_field')
+def sanitize_excel_value(value: str) -> str:
+    """Sanitize value to prevent Excel from interpreting it as a formula"""
+    if not value:
+        return ""
+    
+    # Characters that can trigger Excel formula interpretation
+    formula_chars = ['=', '+', '-', '@', '\t', '\r', '\n']
+    
+    # If value starts with any formula character, add a single quote prefix
+    if any(value.startswith(char) for char in formula_chars):
+        return "'" + value
+    
+    # Clean up any problematic characters
+    value = value.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
+    value = value.replace('\t', ' ')  # Replace tabs with spaces
+    
+    # Limit cell content length (Excel has limits)
+    if len(value) > 32767:  # Excel cell character limit
+        value = value[:32764] + "..."
+    
+    return value
