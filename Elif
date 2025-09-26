@@ -1,21 +1,224 @@
-def sanitize_excel_value(value: str) -> str:
-    """Sanitize value to prevent Excel from interpreting it as a formula"""
-    if not value:
-        return ""
+import spacy
+from spacy.matcher import Matcher
+from spacy.util import filter_spans
+
+class AdvancedUserIntentParser:
+    """Advanced intent parser using spaCy NLP"""
     
-    # Characters that can trigger Excel formula interpretation
-    formula_chars = ['=', '+', '-', '@', '\t', '\r', '\n']
+    def __init__(self):
+        # Load spaCy model
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            print("❌ spaCy model not found. Install with: python -m spacy download en_core_web_sm")
+            # Fallback to basic tokenizer
+            self.nlp = spacy.blank("en")
+        
+        self.matcher = Matcher(self.nlp.vocab)
+        self._setup_patterns()
+        
+        # Test case ID pattern
+        self.tc_id_pattern = r'TC_\d{3}(?:_MODIFIED_\d+)?'
     
-    # If value starts with any formula character, add a single quote prefix
-    if any(value.startswith(char) for char in formula_chars):
-        return "'" + value
+    def _setup_patterns(self):
+        """Setup spaCy matcher patterns for intent recognition"""
+        
+        # Field selection patterns
+        select_patterns = [
+            [{"LOWER": {"IN": ["select", "choose", "pick", "use"]}}, {"TEXT": {"REGEX": ".*"}, "OP": "+"}],
+            [{"LOWER": "work"}, {"LOWER": {"IN": ["on", "with"]}}, {"TEXT": {"REGEX": ".*"}, "OP": "+"}],
+            [{"LOWER": {"IN": ["let's", "lets"]}}, {"LOWER": {"IN": ["work", "start"]}}, {"LOWER": "on", "OP": "?"}, {"TEXT": {"REGEX": ".*"}, "OP": "+"}],
+            [{"LOWER": "i"}, {"LOWER": {"IN": ["want", "need"]}}, {"LOWER": "to", "OP": "?"}, {"LOWER": {"IN": ["work", "use"]}}, {"TEXT": {"REGEX": ".*"}, "OP": "+"}],
+            [{"LOWER": {"IN": ["switch", "go"]}}, {"LOWER": "to"}, {"TEXT": {"REGEX": ".*"}, "OP": "+"}],
+            [{"LOWER": "field"}, {"TEXT": {"REGEX": ".*"}, "OP": "+"}]
+        ]
+        
+        # Search patterns
+        search_patterns = [
+            [{"LOWER": {"IN": ["search", "find", "look"]}}, {"LOWER": "for", "OP": "?"}, {"TEXT": {"REGEX": ".*"}, "OP": "+"}],
+            [{"LOWER": "show"}, {"LOWER": "me", "OP": "?"}, {"TEXT": {"REGEX": ".*"}}, {"LOWER": "fields"}],
+            [{"LOWER": {"IN": ["do", "are"]}}, {"LOWER": "you"}, {"LOWER": "have"}, {"TEXT": {"REGEX": ".*"}, "OP": "+"}],
+            [{"LOWER": "any"}, {"TEXT": {"REGEX": ".*"}}, {"LOWER": "fields", "OP": "?"}]
+        ]
+        
+        # List patterns
+        list_patterns = [
+            [{"LOWER": {"IN": ["list", "show"]}}, {"LOWER": {"IN": ["all", "everything", "options"]}}],
+            [{"LOWER": "what"}, {"LOWER": {"IN": ["fields", "options"]}}, {"LOWER": {"IN": ["are", "do"]}, "OP": "?"}, {"LOWER": {"IN": ["available", "you", "we"]}, "OP": "?"}],
+            [{"LOWER": {"IN": ["show", "list"]}}, {"LOWER": {"IN": ["available", "all"]}, "OP": "?"}, {"LOWER": "fields", "OP": "?"}]
+        ]
+        
+        # Generation patterns
+        generate_patterns = [
+            [{"LOWER": {"IN": ["generate", "create", "make", "build"]}}],
+            [{"LOWER": {"IN": ["generate", "create", "make", "build"]}}, {"LOWER": {"IN": ["test", "tests"]}, "OP": "?"}, {"LOWER": {"IN": ["cases", "case"]}, "OP": "?"}],
+            [{"LOWER": {"IN": ["let's", "lets"]}}, {"LOWER": {"IN": ["start", "begin", "go"]}}],
+            [{"LOWER": {"IN": ["go", "do"]}}, {"LOWER": {"IN": ["ahead", "it"]}}],
+            [{"LOWER": "start"}, {"LOWER": {"IN": ["generating", "creating"]}, "OP": "?"}]
+        ]
+        
+        # More generation patterns
+        more_patterns = [
+            [{"LOWER": {"IN": ["more", "additional", "extra"]}}],
+            [{"LOWER": {"IN": ["generate", "create", "make"]}}, {"LOWER": "more"}],
+            [{"LOWER": {"IN": ["need", "want"]}}, {"LOWER": "more"}],
+            [{"LOWER": "give"}, {"LOWER": "me"}, {"LOWER": "more"}]
+        ]
+        
+        # Improvement/modification patterns
+        improve_patterns = [
+            [{"LOWER": {"IN": ["improve", "enhance", "better", "fix"]}}, {"TEXT": {"REGEX": ".*"}, "OP": "*"}],
+            [{"LOWER": {"IN": ["change", "modify", "update", "adjust"]}}, {"TEXT": {"REGEX": ".*"}, "OP": "*"}],
+            [{"LOWER": "make"}, {"TEXT": {"REGEX": ".*"}, "OP": "*"}, {"LOWER": {"IN": ["better", "different"]}}],
+            [{"LOWER": {"IN": ["can", "could"]}}, {"LOWER": "you"}, {"TEXT": {"REGEX": ".*"}, "OP": "+"}],
+            [{"LOWER": "i"}, {"LOWER": {"IN": ["want", "need"]}}, {"TEXT": {"REGEX": ".*"}, "OP": "+"}]
+        ]
+        
+        # Approval patterns
+        approve_patterns = [
+            [{"LOWER": {"IN": ["approve", "accept", "keep"]}}],
+            [{"LOWER": {"IN": ["yes", "good", "great", "perfect", "excellent"]}}],
+            [{"LOWER": {"IN": ["looks", "look"]}}, {"LOWER": "good"}],
+            [{"LOWER": "that's"}, {"LOWER": {"IN": ["good", "great", "perfect"]}}],
+            [{"LOWER": {"IN": ["approve", "accept", "keep"]}}, {"LOWER": "all"}],
+            [{"LOWER": "i"}, {"LOWER": "like"}, {"TEXT": {"REGEX": ".*"}, "OP": "*"}]
+        ]
+        
+        # Rejection patterns
+        reject_patterns = [
+            [{"LOWER": {"IN": ["reject", "remove", "delete", "discard"]}}],
+            [{"LOWER": {"IN": ["no", "bad", "terrible", "awful", "wrong"]}}],
+            [{"LOWER": {"IN": ["don't", "dont"]}}, {"LOWER": {"IN": ["want", "like"]}}],
+            [{"LOWER": "get"}, {"LOWER": "rid"}, {"LOWER": "of"}],
+            [{"LOWER": {"IN": ["i", "that's"]}}, {"LOWER": {"IN": ["hate", "dislike"]}}]
+        ]
+        
+        # Show/review patterns
+        show_patterns = [
+            [{"LOWER": {"IN": ["show", "display", "see", "review"]}}],
+            [{"LOWER": "what"}, {"LOWER": {"IN": ["do", "did"]}, "OP": "?"}, {"LOWER": {"IN": ["we", "you"]}, "OP": "?"}, {"LOWER": "have"}],
+            [{"LOWER": "let"}, {"LOWER": "me"}, {"LOWER": "see"}],
+            [{"LOWER": {"IN": ["what's", "whats"]}}, {"LOWER": {"IN": ["there", "pending", "generated"]}}]
+        ]
+        
+        # Export patterns
+        export_patterns = [
+            [{"LOWER": {"IN": ["export", "save", "download"]}}],
+            [{"LOWER": {"IN": ["we're", "were", "i'm", "im"]}}, {"LOWER": {"IN": ["done", "finished"]}}],
+            [{"LOWER": {"IN": ["create", "make"]}}, {"LOWER": {"IN": ["file", "excel"]}}],
+            [{"LOWER": {"IN": ["finish", "complete", "done"]}}]
+        ]
+        
+        # Help patterns
+        help_patterns = [
+            [{"LOWER": "help"}],
+            [{"LOWER": {"IN": ["what", "how"]}}, {"LOWER": {"IN": ["can", "do", "should"]}}, {"LOWER": "i"}],
+            [{"LOWER": {"IN": ["i'm", "im"]}}, {"LOWER": {"IN": ["lost", "confused"]}}],
+            [{"LOWER": "guide"}, {"LOWER": "me"}]
+        ]
+        
+        # Add patterns to matcher
+        self.matcher.add("SELECT_FIELD", select_patterns)
+        self.matcher.add("SEARCH_FIELD", search_patterns)
+        self.matcher.add("LIST_FIELDS", list_patterns)
+        self.matcher.add("GENERATE", generate_patterns)
+        self.matcher.add("MORE", more_patterns)
+        self.matcher.add("IMPROVE", improve_patterns)
+        self.matcher.add("APPROVE", approve_patterns)
+        self.matcher.add("REJECT", reject_patterns)
+        self.matcher.add("SHOW", show_patterns)
+        self.matcher.add("EXPORT", export_patterns)
+        self.matcher.add("HELP", help_patterns)
     
-    # Clean up any problematic characters
-    value = value.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
-    value = value.replace('\t', ' ')  # Replace tabs with spaces
+    def parse_intent(self, user_input: str) -> tuple:
+        """Parse user intent using spaCy NLP"""
+        
+        if not user_input.strip():
+            return 'unknown', {}
+        
+        # Extract test case IDs
+        import re
+        tc_ids = re.findall(self.tc_id_pattern, user_input.upper())
+        
+        # Process with spaCy
+        doc = self.nlp(user_input.lower())
+        matches = self.matcher(doc)
+        
+        if matches:
+            # Get the best match (first one found)
+            match_id, start, end = matches[0]
+            label = self.nlp.vocab.strings[match_id]
+            matched_span = doc[start:end]
+            
+            # Convert spaCy label to intent
+            intent_map = {
+                "SELECT_FIELD": "select_field",
+                "SEARCH_FIELD": "search_field", 
+                "LIST_FIELDS": "list_fields",
+                "GENERATE": "generate",
+                "MORE": "regenerate",
+                "IMPROVE": "improve",
+                "APPROVE": "approve",
+                "REJECT": "reject",
+                "SHOW": "show_pending",
+                "EXPORT": "export",
+                "HELP": "help"
+            }
+            
+            intent = intent_map.get(label, "unknown")
+            
+            # Extract target/context
+            params = {'tc_ids': tc_ids}
+            
+            # Get remaining text as target
+            remaining_tokens = [token.text for i, token in enumerate(doc) if i < start or i >= end]
+            if remaining_tokens:
+                params['target'] = ' '.join(remaining_tokens).strip()
+            elif end < len(doc):
+                params['target'] = ' '.join([token.text for token in doc[end:]]).strip()
+            
+            # Clean up target
+            if 'target' in params and params['target']:
+                # Remove common stop words from target
+                target = params['target']
+                stop_words = {'the', 'a', 'an', 'to', 'for', 'with', 'on', 'at', 'by'}
+                target_words = [word for word in target.split() if word.lower() not in stop_words]
+                if target_words:
+                    params['target'] = ' '.join(target_words)
+            
+            return intent, params
+        
+        # Fallback to keyword matching
+        return self._keyword_fallback(user_input, tc_ids)
     
-    # Limit cell content length (Excel has limits)
-    if len(value) > 32767:  # Excel cell character limit
-        value = value[:32764] + "..."
-    
-    return value
+    def _keyword_fallback(self, user_input: str, tc_ids: list) -> tuple:
+        """Fallback keyword-based matching"""
+        
+        keywords = {
+            'generate': ['generate', 'create', 'make', 'build', 'start'],
+            'approve': ['approve', 'accept', 'good', 'yes', 'keep', 'like'],
+            'reject': ['reject', 'remove', 'delete', 'bad', 'no'],
+            'show_pending': ['show', 'display', 'see', 'what', 'review'],
+            'export': ['export', 'save', 'download', 'done', 'finish'],
+            'help': ['help', 'how', 'what can', 'guide'],
+            'improve': ['improve', 'change', 'modify', 'better', 'fix'],
+            'select_field': ['select', 'choose', 'pick', 'use', 'work on'],
+            'search_field': ['search', 'find', 'look for']
+        }
+        
+        user_lower = user_input.lower()
+        
+        # Count keyword matches
+        best_intent = None
+        best_score = 0
+        
+        for intent, words in keywords.items():
+            score = sum(1 for word in words if word in user_lower)
+            if score > best_score:
+                best_score = score
+                best_intent = intent
+        
+        if best_intent and best_score > 0:
+            return best_intent, {'tc_ids': tc_ids, 'target': user_input, 'fallback': True}
+        
+        return 'unknown', {'raw_input': user_input, 'tc_ids': tc_ids}
