@@ -358,4 +358,55 @@ class AdvancedUserIntentParser:
                     # Give higher score for exact matches
                     if user_input_lower == word:
                         score += 3
-          
+                    else:
+                        score += 1
+            
+            if score > 0:
+                intent_scores[intent] = score
+        
+        # Return intent with highest score
+        if intent_scores:
+            best_intent = max(intent_scores.items(), key=lambda x: x[1])[0]
+            
+            params = {'tc_ids': all_ids, 'target': original_input, 'fallback': True}
+            
+            # Add modification context if relevant
+            if any('MODIFIED' in tc_id for tc_id in all_ids):
+                params['is_modification_action'] = True
+                params['modification_ids'] = [tc_id for tc_id in all_ids if 'MODIFIED' in tc_id]
+            
+            return best_intent, params
+        
+        # Final fallback using fuzzy matching
+        best_intent = self._fuzzy_match_intent(user_input_lower)
+        if best_intent:
+            return best_intent, {'tc_ids': all_ids, 'target': original_input, 'fuzzy': True}
+        
+        return 'unknown', {'raw_input': original_input, 'tc_ids': all_ids}
+    
+    def _fuzzy_match_intent(self, user_input: str) -> str:
+        """Use fuzzy matching for intent recognition as final fallback"""
+        
+        intent_keywords = {
+            'generate': ['generate', 'create', 'make', 'build'],
+            'approve': ['approve', 'accept', 'yes', 'good', 'keep'],
+            'reject': ['reject', 'no', 'bad', 'remove', 'delete'],
+            'export': ['export', 'save', 'download', 'excel'],
+            'show_pending': ['show', 'display', 'review', 'see'],
+            'help': ['help', 'commands', 'how'],
+            'improve': ['improve', 'change', 'modify', 'better'],
+            'select_field': ['select', 'choose', 'field'],
+            'regenerate': ['more', 'additional', 'again']
+        }
+
+        best_match = None
+        best_score = 0.6  # Minimum similarity threshold
+
+        for intent, keywords in intent_keywords.items():
+            for keyword in keywords:
+                similarity = SequenceMatcher(None, user_input, keyword).ratio()
+                if similarity > best_score:
+                    best_score = similarity
+                    best_match = intent
+
+        return best_match
