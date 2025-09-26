@@ -1,0 +1,13 @@
+elif intent == 'complete_field':
+    if not session.current_field_metadata:
+        response = "❌ No field is currently selected to complete."
+    else:
+        if generator.is_field_ready_for_completion():
+            completion_result = generator.complete_current_field()
+            field_name = completion_result.get('completed_field', 'Unknown')
+            approved_count = completion_result.get('approved_count', 0)
+            response = f"✅ Completed field {field_name} with {approved_count} approved test cases. You can now export or work on another field."
+        else:
+            response = "❌ Current field needs at least one approved test case before completion."
+    print(f"🤖 Assistant: {response}")
+    session.add_interaction(user_input, response, 'complete_field')
