@@ -1,0 +1,74 @@
+def find_field_fuzzy(target: str, field_list: list) -> str:
+    """Enhanced field matching with explicit returns"""
+    
+    target = target.lower().strip()
+    
+    # Step 1: Exact full path match
+    for field in field_list:
+        if target == field.lower():
+            return field
+    
+    # Step 2: Exact field name match - BE VERY EXPLICIT
+    exact_name_matches = []
+    for field in field_list:
+        field_name = field.split('/')[-1].lower()
+        if target == field_name:
+            exact_name_matches.append(field)
+    
+    # CRITICAL: Handle exact matches explicitly
+    if len(exact_name_matches) == 0:
+        # No exact matches - continue to fuzzy matching
+        pass
+    elif len(exact_name_matches) == 1:
+        # Single match - return it
+        return exact_name_matches[0]
+    else:
+        # Multiple matches - MUST return None
+        print(f"⚠️  Multiple fields named '{target}' found:")
+        for i, field in enumerate(exact_name_matches, 1):
+            parent = '/'.join(field.split('/')[:-1])
+            print(f"   {i}. {field.split('/')[-1]} in {parent}")
+        print("Please be more specific (e.g., 'customer postalCode' or provide full path)")
+        return None  # EXPLICIT RETURN
+    
+    # Step 3: Partial path matching (only if no exact matches)
+    target_words = target.split()
+    best_matches = []
+    
+    for field in field_list:
+        field_segments = [seg.lower() for seg in field.split('/') if seg]
+        
+        # Count matching segments
+        matches = 0
+        for word in target_words:
+            for segment in field_segments:
+                if word in segment:
+                    matches += 1
+                    break
+        
+        if matches >= len(target_words):
+            best_matches.append(field)
+    
+    if len(best_matches) == 1:
+        return best_matches[0]
+    elif len(best_matches) > 1:
+        print(f"⚠️  Multiple partial matches for '{target}':")
+        for i, field in enumerate(best_matches[:3], 1):
+            field_name = field.split('/')[-1]
+            parent = '/'.join(field.split('/')[:-1])
+            print(f"   {i}. {field_name} ({parent})")
+        return None
+    
+    # Step 4: Fuzzy matching (only if no other matches)
+    best_match = None
+    best_score = 0.6
+    
+    for field in field_list:
+        field_name = field.split('/')[-1].lower()
+        from difflib import SequenceMatcher
+        similarity = SequenceMatcher(None, target, field_name).ratio()
+        if similarity > best_score:
+            best_score = similarity
+            best_match = field
+    
+    return best_match  # Could be None
