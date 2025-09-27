@@ -1,0 +1,428 @@
+This is a common issue with field matching! The problem is that you're using only the field name (last part of the path) for display and matching, which causes conflicts when multiple fields have the same name but different paths.
+
+## **Problem Analysis**
+
+```python
+# Current behavior:
+field = "/customer/address/postalCode"  → displays as "postalCode"
+field = "/billing/address/postalCode"   → displays as "postalCode" (CONFLICT!)
+
+# User says "select postalCode" → Which one should it pick?
+```
+
+## **Solutions**
+
+### **1. Fix Field Display to Show Path Context**
+
+**FIND in your `handle_list_fields()` function:**
+```python
+field_name = field.split('/')[-1]
+response += f"{i+1:2d}. {field_name}\n"
+```
+
+**REPLACE with:**
+```python
+field_name = field.split('/')[-1]
+# Show context for disambiguation
+if field.count('/') > 1:
+    parent_path = '/'.join(field.split('/')[:-1])
+    display_name = f"{field_name} ({parent_path})"
+else:
+    display_name = field_name
+
+response += f"{i+1:2d}. {display_name}\n"
+```
+
+### **2. Fix Field Search to Show Full Context**
+
+**FIND in your `handle_search_fields()` function:**
+```python
+field_name = match.split('/')[-1]
+response += f"{i+1}. {field_name}\n"
+```
+
+**REPLACE with:**
+```python
+field_name = match.split('/')[-1]
+# Show full path for disambiguation
+if len([f for f in matches if f.split('/')[-1] == field_name]) > 1:
+    # Multiple fields with same name - show full path
+    display_name = match
+else:
+    # Unique name - show with parent context
+    if match.count('/') > 1:
+        parent_path = '/'.join(match.split('/')[:-1])
+        display_name = f"{field_name} ({parent_path})"
+    else:
+        display_name = field_name
+
+response += f"{i+1}. {display_name}\n"
+```
+
+### **3. Fix Field Selection Logic**
+
+**REPLACE your `find_field_fuzzy()` function with this enhanced version:**
+
+```python
+def find_field_fuzzy(target: str, field_list: list) -> str:
+    """Enhanced field matching with path awareness"""
+    
+    target = target.lower().strip()
+    
+    # Step 1: Exact full path match
+    for field in field_list:
+        if target == field.lower():
+            return field
+    
+    # Step 2: Exact field name match (if only one exists)
+    exact_name_matches = []
+    for field in field_list:
+        field_name = field.split('/')[-1].lower()
+        if target == field_name:
+            exact_name_matches.append(field)
+    
+    if len(exact_name_matches) == 1:
+        return exact_name_matches[0]
+    elif len(exact_name_matches) > 1:
+        # Multiple matches - try to disambiguate
+        print(f"⚠️  Multiple fields named '{target}' found:")
+        for i, field in enumerate(exact_name_matches, 1):
+            parent = '/'.join(field.split('/')[:-1])
+            print(f"   {i}. {field.split('/')[-1]} in {parent}")
+        print("Please be more specific (e.g., 'customer postalCode' or provide full path)")
+        return None
+    
+    # Step 3: Partial path matching
+    path_matches = []
+    for field in field_list:
+        # Check if target appears in the path segments
+        field_segments = [seg.lower() for seg in field.split('/') if seg]
+        target_words = target.split()
+        
+        # Count matching path segments
+        matches = 0
+        for word in target_words:
+            for segment in field_segments:
+                if word in segment or segment in word:
+                    matches += 1
+                    break
+        
+        if matches >= len(target_words):
+            path_matches.append((field, matches))
+    
+    if path_matches:
+        # Sort by number of matches (best first)
+        path_matches.sort(key=lambda x: x[1], reverse=True)
+        best_matches = [field for field, score in path_matches if score == path_matches[0][1]]
+        
+        if len(best_matches) == 1:
+            return best_matches[0]
+        elif len(best_matches) > 1:
+            print(f"⚠️  Multiple partial matches for '{target}':")
+            for i, field in enumerate(best_matches[:5], 1):  # Show top 5
+                field_name = field.split('/')[-1]
+                parent = '/'.join(field.split('/')[:-1])
+                print(f"   {i}. {field_name} ({parent})")
+            return None
+    
+    # Step 4: Fuzzy matching on field names
+    best_match = None
+    best_score = 0.6
+    
+    for field in field_list:
+        field_name = field.split('/')[-1].lower()
+        similarity = SequenceMatcher(None, target, field_name).ratio()
+        if similarity > best_score:
+            best_score = similarity
+            best_match = field
+    
+    return best_match
+```
+
+### **4. Enhanced Field Selection Handler**
+
+**UPDATE your `handle_select_field()` function:**
+
+```python
+def handle_select_field(target: str, field_list: list, field_loader) -> tuple:
+    """Enhanced field selection with better disambiguation"""
+    
+    if not target:
+        return None, "Which field should I select? Try 'select PostalCode' or provide more context like 'select customer PostalCode'."
+    
+    # Try to find the field
+    selected_field = find_field_fuzzy(target, field_list)
+    
+    if not selected_field:
+        # Provide helpful suggestions
+        suggestions = []
+        target_lower = target.lower()
+        
+        # Find fields containing any part of the target
+        for field in field_list:
+            field_segments = field.lower().split('/')
+            if any(target_lower in segment or segment in target_lower for segment in field_segments):
+                suggestions.append(field)
+        
+        if suggestions:
+            response = f"❌ Couldn't find exact match for '{target}'. Did you mean one of these?\n"
+            for i, field in enumerate(suggestions[:5], 1):
+                field_name = field.split('/')[-1]
+                parent = '/'.join(field.split('/')[:-1]) if '/' in field else ''
+                display = f"{field_name} ({parent})" if parent else field_name
+                response += f"   {i}. {display}\n"
+            response += f"\nTry: 'select {suggestions[0].split('/')[-1]}' or be more specific."
+            return None, response
+        else:
+            return None, f"❌ No fields found matching '{target}'. Try 'search {target}' to find similar fields."
+    
+    # Field found - load metadata
+    try:
+        field_metadata = field_loader.get_field_metadata(selected_field)
+        if not field_metadata:
+            return None, "❌ Found the field but couldn't load its metadata. Please try another field."
+        
+        field_name = selected_field.split('/')[-1]
+        parent_path = '/'.join(selected_field.split('/')[:-1])
+        context_info = f" in {parent_path}" if parent_path else ""
+        
+        return selected_field, f"✅ Selected: {field_name}{context_info}\nPath: {selected_field}\nSay 'generate' to create test cases for this field."
+        
+    except Exception as e:
+        return None, f"❌ Error loading field data: {str(e)}"
+```
+
+### **5. Add Smart Field Suggestions**
+
+**ADD this helper function:**
+
+```python
+def suggest_field_disambiguation(target: str, field_list: list) -> str:
+    """Suggest ways to disambiguate field selection"""
+    
+    target_lower = target.lower()
+    field_name_groups = {}
+    
+    # Group fields by name
+    for field in field_list:
+        name = field.split('/')[-1].lower()
+        if name not in field_name_groups:
+            field_name_groups[name] = []
+        field_name_groups[name].append(field)
+    
+    # Find ambiguous fields
+    suggestions = []
+    for name, paths in field_name_groups.items():
+        if len(paths) > 1 and target_lower in name:
+            suggestions.append(f"For '{name}' field:")
+            for path in paths:
+                parent = '/'.join(path.split('/')[:-1])
+                suggestions.append(f"  • Try: 'select {parent.split('/')[-1]} {name}' for {path}")
+    
+    return "\n".join(suggestions) if suggestions else ""
+```
+
+## **Example of Fixed Behavior**
+
+### **Before (Problematic):**
+```
+Available fields:
+1. postalCode
+2. postalCode  ← CONFUSING!
+3. emailAddress
+```
+
+### **After (Clear):**
+```
+Available fields:
+1. postalCode (/customer/address)
+2. postalCode (/billing/address)
+3. emailAddress (/customer/contact)
+```
+
+### **Smart Selection:**
+```
+User: "select postalCode"
+System: ⚠️ Multiple fields named 'postalCode' found:
+   1. postalCode in /customer/address  
+   2. postalCode in /billing/address
+Please be more specific (e.g., 'customer postalCode' or provide full path)
+
+User: "select customer postalCode"  
+System: ✅ Selected: postalCode (/customer/address)
+```
+
+This approach eliminates ambiguity and makes field selection much more user-friendly!
+
+Good question! The `suggest_field_disambiguation()` function should be called in the **error handling section** when field selection fails due to ambiguity. Here's exactly where to integrate it:
+
+## **Integration Points**
+
+### **1. In `handle_select_field()` function**
+
+**FIND this section:**
+```python
+if not selected_field:
+    # Provide helpful suggestions
+    suggestions = []
+    target_lower = target.lower()
+    
+    # Find fields containing any part of the target
+    for field in field_list:
+        field_segments = field.lower().split('/')
+        if any(target_lower in segment or segment in target_lower for segment in field_segments):
+            suggestions.append(field)
+    
+    if suggestions:
+        response = f"❌ Couldn't find exact match for '{target}'. Did you mean one of these?\n"
+        # ... existing code ...
+    else:
+        return None, f"❌ No fields found matching '{target}'. Try 'search {target}' to find similar fields."
+```
+
+**REPLACE the `else` block with:**
+```python
+    else:
+        # Try smart disambiguation suggestions
+        disambiguation_help = suggest_field_disambiguation(target, field_list)
+        
+        if disambiguation_help:
+            return None, f"❌ No exact match for '{target}'. Here are some suggestions:\n\n{disambiguation_help}"
+        else:
+            return None, f"❌ No fields found matching '{target}'. Try 'search {target}' to find similar fields or 'list fields' to see all options."
+```
+
+### **2. In `find_field_fuzzy()` function**
+
+**FIND this section where multiple exact matches are found:**
+```python
+elif len(exact_name_matches) > 1:
+    # Multiple matches - try to disambiguate
+    print(f"⚠️  Multiple fields named '{target}' found:")
+    for i, field in enumerate(exact_name_matches, 1):
+        parent = '/'.join(field.split('/')[:-1])
+        print(f"   {i}. {field.split('/')[-1]} in {parent}")
+    print("Please be more specific (e.g., 'customer postalCode' or provide full path)")
+    return None
+```
+
+**REPLACE with:**
+```python
+elif len(exact_name_matches) > 1:
+    # Multiple matches - try to disambiguate
+    print(f"⚠️  Multiple fields named '{target}' found:")
+    for i, field in enumerate(exact_name_matches, 1):
+        parent = '/'.join(field.split('/')[:-1])
+        print(f"   {i}. {field.split('/')[-1]} in {parent}")
+    
+    # Add smart suggestions
+    disambiguation_help = suggest_field_disambiguation(target, field_list)
+    if disambiguation_help:
+        print(f"\n💡 Try these specific commands:\n{disambiguation_help}")
+    else:
+        print("Please be more specific (e.g., 'customer postalCode' or provide full path)")
+    
+    return None
+```
+
+### **3. In `handle_search_fields()` function (Optional Enhancement)**
+
+**ADD at the end of the function when no matches found:**
+
+**FIND:**
+```python
+if not matches:
+    return f"❌ No fields found containing '{keyword}'. Try a different keyword."
+```
+
+**REPLACE with:**
+```python
+if not matches:
+    # Try disambiguation suggestions as fallback
+    disambiguation_help = suggest_field_disambiguation(keyword, field_list)
+    
+    if disambiguation_help:
+        return f"❌ No direct matches for '{keyword}', but here are some related suggestions:\n\n{disambiguation_help}"
+    else:
+        return f"❌ No fields found containing '{keyword}'. Try a different keyword or 'list fields' to see all options."
+```
+
+### **4. In the main conversation loop (Optional)**
+
+**You could also add it in the `handle_unknown_intent()` function:**
+
+```python
+def handle_unknown_intent(user_input: str, session: ConversationalSession, generator: TestObjectiveGeneratorCore) -> str:
+    # ... existing logic ...
+    
+    # Check for field references
+    if any(indicator in user_input for indicator in ['/', 'Code', 'Name', 'Address', 'Email', 'Phone']):
+        # Try disambiguation suggestions
+        available_fields = field_loader.get_available_fields() if 'field_loader' in globals() else []
+        if available_fields:
+            disambiguation_help = suggest_field_disambiguation(user_input, available_fields)
+            if disambiguation_help:
+                return f"It looks like you mentioned a field. Here are some specific suggestions:\n\n{disambiguation_help}"
+        
+        return f"It looks like you mentioned a field name. Try 'select {user_input}' to work on it."
+```
+
+## **Complete Updated Example**
+
+Here's the complete `handle_select_field()` function with proper integration:
+
+```python
+def handle_select_field(target: str, field_list: list, field_loader) -> tuple:
+    """Enhanced field selection with smart disambiguation"""
+    
+    if not target:
+        return None, "Which field should I select? Try 'select PostalCode' or provide more context like 'select customer PostalCode'."
+    
+    # Try to find the field
+    selected_field = find_field_fuzzy(target, field_list)
+    
+    if not selected_field:
+        # First try to find partial matches
+        suggestions = []
+        target_lower = target.lower()
+        
+        for field in field_list:
+            field_segments = field.lower().split('/')
+            if any(target_lower in segment or segment in target_lower for segment in field_segments):
+                suggestions.append(field)
+        
+        if suggestions:
+            response = f"❌ Couldn't find exact match for '{target}'. Did you mean one of these?\n\n"
+            for i, field in enumerate(suggestions[:5], 1):
+                field_name = field.split('/')[-1]
+                parent = '/'.join(field.split('/')[:-1]) if '/' in field else ''
+                display = f"{field_name} ({parent})" if parent else field_name
+                response += f"   {i}. {display}\n"
+            response += f"\n💡 Try: 'select {suggestions[0].split('/')[-1]}' or be more specific."
+            return None, response
+        else:
+            # Use smart disambiguation as final fallback
+            disambiguation_help = suggest_field_disambiguation(target, field_list)
+            
+            if disambiguation_help:
+                return None, f"❌ No exact match for '{target}'. Here are some suggestions:\n\n{disambiguation_help}\n\nOr try 'search {target}' to find similar fields."
+            else:
+                return None, f"❌ No fields found matching '{target}'. Try 'search {target}' to find similar fields or 'list fields' to see all options."
+    
+    # Field found successfully - proceed with selection
+    try:
+        field_metadata = field_loader.get_field_metadata(selected_field)
+        if not field_metadata:
+            return None, "❌ Found the field but couldn't load its metadata. Please try another field."
+        
+        field_name = selected_field.split('/')[-1]
+        parent_path = '/'.join(selected_field.split('/')[:-1])
+        context_info = f" in {parent_path}" if parent_path else ""
+        
+        return selected_field, f"✅ Selected: {field_name}{context_info}\nPath: {selected_field}\nSay 'generate' to create test cases for this field."
+        
+    except Exception as e:
+        return None, f"❌ Error loading field data: {str(e)}"
+```
+
+This way, `suggest_field_disambiguation()` is called as a **smart fallback** when normal field matching fails, providing users with specific, actionable suggestions to resolve field ambiguity.
