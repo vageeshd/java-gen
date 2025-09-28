@@ -1,99 +1,48 @@
-def handle_search_fields(keyword: str, field_list: list) -> str:
-    """Simple field search - no over-processing"""
+def _build_intent_parameters(self, label: str, doc, start: int, end: int, 
+                           all_ids: list, original_input: str, cleaned_input: str) -> dict:
+    """Fixed parameter extraction for field operations"""
     
-    print(f"[SEARCH DEBUG] Raw keyword: '{keyword}'")
+    params = {'tc_ids': all_ids}
     
-    if not keyword:
-        return "What should I search for? Try: 'search address'"
-    
-    # Simple cleanup - just remove obvious command words
-    search_terms = keyword.lower().strip()
-    
-    # Remove command words
-    command_words = ['search', 'find', 'look', 'for', 'field', 'fields']
-    words = search_terms.split()
-    clean_words = [w for w in words if w not in command_words]
-    
-    if not clean_words:
-        return "Please specify what to search for."
-    
-    search_term = ' '.join(clean_words)
-    print(f"[SEARCH DEBUG] Clean search term: '{search_term}'")
-    
-    # Search in field paths
-    matches = []
-    for field in field_list:
-        if search_term in field.lower():
-            matches.append(field)
-    
-    if not matches:
-        return f"❌ No fields found containing '{search_term}'. Try a different keyword."
-    
-    response = f"✅ Found {len(matches)} fields containing '{search_term}':\n\n"
-    
-    for i, field in enumerate(matches, 1):
-        # Show field name and path clearly
-        field_name = field.split('/')[-1]
-        parent = '/'.join(field.split('/')[:-1]) if '/' in field else ''
+    if label in ["SELECT_FIELD", "SEARCH_FIELD"]:
+        # For field operations, extract from ORIGINAL input, not cleaned
+        print(f"[PARAM DEBUG] Original input: '{original_input}'")
+        print(f"[PARAM DEBUG] Label: {label}")
         
-        if parent:
-            response += f"{i:2d}. {field_name} (in {parent})\n"
-        else:
-            response += f"{i:2d}. {field}\n"
-    
-    # Give clear selection instruction using actual field path
-    response += f"\n💡 To select one: 'select {matches[0]}'"
-    return response
-def handle_select_field(target: str, field_list: list, field_loader) -> tuple:
-    """Ultra-simple field selection"""
-    
-    print(f"[SELECT DEBUG] Raw target: '{target}'")
-    
-    if not target or not target.strip():
-        return None, "Which field should I select?"
-    
-    target = target.strip()
-    print(f"[SELECT DEBUG] Trimmed target: '{target}'")
-    
-    # Case 1: Full path provided (contains /)
-    if '/' in target:
-        print(f"[SELECT DEBUG] Full path provided")
+        # Simple approach - find command word and take everything after it
+        original_lower = original_input.lower()
         
-        for field in field_list:
-            if field.lower() == target.lower():
-                print(f"[SELECT DEBUG] Exact match found: {field}")
-                return load_field_directly(field, field_loader)
+        # Find the command word position
+        command_patterns = [
+            'select ', 'choose ', 'pick ', 'search ', 'find ',
+            'switch to ', 'go to ', 'use '
+        ]
         
-        return None, f"❌ Field path not found: {target}"
+        target = ""
+        for pattern in command_patterns:
+            if pattern in original_lower:
+                # Take everything after the command
+                split_pos = original_lower.find(pattern) + len(pattern)
+                target = original_input[split_pos:].strip()
+                break
+        
+        # Fallback - if no command found, take last word(s)
+        if not target:
+            words = original_input.split()
+            if len(words) > 1:
+                target = words[-1]  # Take last word
+        
+        params['target'] = target
+        print(f"[PARAM DEBUG] Extracted target: '{target}'")
     
-    # Case 2: Field name only
-    print(f"[SELECT DEBUG] Field name only")
-    
-    matches = []
-    for field in field_list:
-        field_name = field.split('/')[-1]
-        if field_name.lower() == target.lower():
-            matches.append(field)
-    
-    if len(matches) == 1:
-        return load_field_directly(matches[0], field_loader)
-    elif len(matches) > 1:
-        response = f"⚠️ Multiple '{target}' fields found:\n\n"
-        for i, field in enumerate(matches, 1):
-            response += f"{i}. {field}\n"
-        response += f"\n💡 Use full path: 'select {matches[0]}'"
-        return None, response
     else:
-        return None, f"❌ No field named '{target}' found."
-
-def load_field_directly(field_path: str, field_loader) -> tuple:
-    """Load field metadata directly"""
-    try:
-        metadata = field_loader.get_field_metadata(field_path)
-        if metadata:
-            field_name = field_path.split('/')[-1]
-            return field_path, f"✅ Selected: {field_name}\n📍 {field_path}"
+        # For other intents, use existing logic
+        remaining_tokens = [token.text for i, token in enumerate(doc) if i < start or i >= end]
+        if remaining_tokens:
+            params['target'] = ' '.join(remaining_tokens).strip()
+        elif end < len(doc):
+            params['target'] = ' '.join([token.text for token in doc[end:]]).strip()
         else:
-            return None, f"❌ Couldn't load metadata for: {field_path}"
-    except Exception as e:
-        return None, f"❌ Error: {str(e)}"
+            params['target'] = cleaned_input
+    
+    return params
