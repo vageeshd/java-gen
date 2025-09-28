@@ -1,376 +1,99 @@
-You're absolutely right! We've over-complicated this. The logs show exactly what's wrong:
-
-## **Issues in the Logs**
-
-1. **Target isn't cleaned**: It's comparing `'select postalcode'` instead of just `'postalcode'`
-2. **Search is broken**: It's literally searching for the phrase "search taxexempt" instead of just "taxexempt"
-3. **Fuzzy logic is overkill**: We need simple, direct matching
-
-## **Simple, Clean Solution**
-
-Replace your `find_field_fuzzy()` with this straightforward approach:
-
-```python
-def find_field_simple(target: str, field_list: list) -> str:
-    """Simple, direct field matching - no over-complication"""
-    
-    if not target or not field_list:
-        return None
-    
-    # Clean the target - remove command words
-    target_clean = target.lower().strip()
-    
-    # Remove command words that shouldn't be part of field matching
-    command_words = ['select', 'choose', 'pick', 'use', 'switch', 'to', 'search', 'find']
-    words = target_clean.split()
-    cleaned_words = [word for word in words if word not in command_words]
-    
-    if not cleaned_words:
-        return None
-    
-    target_clean = ' '.join(cleaned_words)
-    
-    print(f"[DEBUG] Clean target: '{target_clean}'")
-    
-    # Case 1: Full path provided - exact match only
-    if '/' in target_clean:
-        print(f"[DEBUG] Full path provided, looking for exact match")
-        for field in field_list:
-            if field.lower() == target_clean:
-                print(f"[DEBUG] Exact path match: {field}")
-                return field
-        
-        print(f"[DEBUG] No exact path match found")
-        return None
-    
-    # Case 2: Field name only - check last part of paths
-    print(f"[DEBUG] Field name only, checking field names")
-    
-    matches = []
-    for field in field_list:
-        field_name = field.split('/')[-1].lower()
-        if field_name == target_clean:
-            matches.append(field)
-            print(f"[DEBUG] Field name match: {field}")
-    
-    if len(matches) == 1:
-        print(f"[DEBUG] Single match found: {matches[0]}")
-        return matches[0]
-    elif len(matches) > 1:
-        print(f"[DEBUG] Multiple matches found:")
-        for match in matches:
-            print(f"  - {match}")
-        return None  # Let caller handle multiple matches
-    else:
-        print(f"[DEBUG] No field name matches found")
-        return None
-```
-
-## **Fix Search Function**
-
-Replace your `handle_search_fields()` with:
-
-```python
 def handle_search_fields(keyword: str, field_list: list) -> str:
-    """Simple field search"""
+    """Simple field search - no over-processing"""
+    
+    print(f"[SEARCH DEBUG] Raw keyword: '{keyword}'")
     
     if not keyword:
-        return "What should I search for? Try: 'search address' or 'search email'"
+        return "What should I search for? Try: 'search address'"
     
-    # Clean keyword - remove 'search' command word
-    keyword_clean = keyword.lower().strip()
-    if keyword_clean.startswith('search '):
-        keyword_clean = keyword_clean[7:].strip()
+    # Simple cleanup - just remove obvious command words
+    search_terms = keyword.lower().strip()
     
-    print(f"[DEBUG] Searching for keyword: '{keyword_clean}'")
+    # Remove command words
+    command_words = ['search', 'find', 'look', 'for', 'field', 'fields']
+    words = search_terms.split()
+    clean_words = [w for w in words if w not in command_words]
     
+    if not clean_words:
+        return "Please specify what to search for."
+    
+    search_term = ' '.join(clean_words)
+    print(f"[SEARCH DEBUG] Clean search term: '{search_term}'")
+    
+    # Search in field paths
     matches = []
     for field in field_list:
-        if keyword_clean in field.lower():
+        if search_term in field.lower():
             matches.append(field)
     
     if not matches:
-        return f"❌ No fields found containing '{keyword_clean}'. Try a different keyword."
+        return f"❌ No fields found containing '{search_term}'. Try a different keyword."
     
-    response = f"✅ Found {len(matches)} fields containing '{keyword_clean}':\n\n"
+    response = f"✅ Found {len(matches)} fields containing '{search_term}':\n\n"
     
     for i, field in enumerate(matches, 1):
+        # Show field name and path clearly
         field_name = field.split('/')[-1]
         parent = '/'.join(field.split('/')[:-1]) if '/' in field else ''
         
         if parent:
             response += f"{i:2d}. {field_name} (in {parent})\n"
         else:
-            response += f"{i:2d}. {field_name}\n"
+            response += f"{i:2d}. {field}\n"
     
+    # Give clear selection instruction using actual field path
     response += f"\n💡 To select one: 'select {matches[0]}'"
     return response
-```
-
-## **Fix Field Selection Handler**
-
-Replace your `handle_select_field()` with:
-
-```python
 def handle_select_field(target: str, field_list: list, field_loader) -> tuple:
-    """Simple field selection - no over-complication"""
+    """Ultra-simple field selection"""
     
-    if not target:
-        return None, "Which field should I select? Try 'select fieldName' or provide full path."
+    print(f"[SELECT DEBUG] Raw target: '{target}'")
     
-    print(f"[DEBUG] Selecting field: '{target}'")
-    
-    # Try to find the field
-    selected_field = find_field_simple(target, field_list)
-    
-    if selected_field:
-        # Single field found - select it
-        try:
-            field_metadata = field_loader.get_field_metadata(selected_field)
-            if not field_metadata:
-                return None, f"❌ Found field but couldn't load metadata for: {selected_field}"
-            
-            field_name = selected_field.split('/')[-1]
-            return selected_field, f"✅ Selected: {field_name}\nPath: {selected_field}"
-            
-        except Exception as e:
-            return None, f"❌ Error loading field: {str(e)}"
-    
-    else:
-        # No single match - check if it was multiple matches
-        target_clean = target.lower().strip()
-        command_words = ['select', 'choose', 'pick', 'use', 'switch', 'to']
-        words = target_clean.split()
-        cleaned_words = [word for word in words if word not in command_words]
-        
-        if cleaned_words:
-            target_clean = ' '.join(cleaned_words)
-            
-            # Check for multiple field name matches
-            if '/' not in target_clean:
-                matches = []
-                for field in field_list:
-                    field_name = field.split('/')[-1].lower()
-                    if field_name == target_clean:
-                        matches.append(field)
-                
-                if len(matches) > 1:
-                    response = f"⚠️ Multiple fields named '{target_clean}' found:\n\n"
-                    for i, field in enumerate(matches, 1):
-                        response += f"{i}. {field}\n"
-                    response += f"\n💡 Select specific one using full path:\n"
-                    response += f"Example: 'select {matches[0]}'"
-                    return None, response
-        
-        return None, f"❌ No field found matching '{target}'. Try 'search {target}' or 'list fields'."
-```
-
-## **Update Intent Parser Parameters**
-
-Make sure your intent parser passes clean targets:
-
-```python
-def _build_intent_parameters(self, label: str, doc, start: int, end: int, 
-                           all_ids: list, original_input: str, cleaned_input: str) -> dict:
-    """Build parameters - ensure target is clean"""
-    
-    params = {'tc_ids': all_ids}
-    
-    # For field selection, extract just the field part
-    if label == "SELECT_FIELD":
-        # Remove the command words, keep just the field reference
-        remaining_tokens = [token.text for i, token in enumerate(doc) if i < start or i >= end]
-        target = ' '.join(remaining_tokens).strip()
-        
-        # Clean out command words
-        command_words = ['select', 'choose', 'pick', 'use', 'switch', 'to', 'the', 'a', 'an']
-        target_words = [word for word in target.split() if word not in command_words]
-        
-        params['target'] = ' '.join(target_words) if target_words else target
-    else:
-        # Standard parameter extraction for other intents
-        # ... existing logic
-    
-    return params
-```
-
-## **The Key Changes**
-
-1. **Simple target cleaning** - remove command words before matching
-2. **Two-case logic** - full path vs field name only
-3. **Direct matching** - no fuzzy logic, no complex scoring
-4. **Clear error messages** - tell user exactly what to do
-5. **Fixed search** - clean the keyword properly
-
-This approach is much cleaner, more predictable, and easier to debug. The logs should now show clean comparisons like:
-
-```
-[DEBUG] Clean target: 'postalcode'
-[DEBUG] Field name only, checking field names  
-[DEBUG] Field name match: personpartyinfo/persondata/contact/postaddr/postalcode
-```
-
-You're absolutely right! Let me trace through the logic:
-
-## **Current Flow Issue**
-
-1. User: `"select postalcode"` 
-2. System finds multiple matches → shows list → returns `None`
-3. User: `"select personpartyinfo/persondata/contact/postaddr/postalcode"`
-4. System **unnecessarily verifies again** instead of just passing to metadata extractor
-
-## **Simple Fix**
-
-**Replace the field selection logic with this streamlined approach:**
-
-```python
-def handle_select_field(target: str, field_list: list, field_loader) -> tuple:
-    """Streamlined field selection - direct path or disambiguation only"""
-    
-    if not target:
+    if not target or not target.strip():
         return None, "Which field should I select?"
     
-    # Clean target - remove command words
-    target_clean = target.lower().strip()
-    command_words = ['select', 'choose', 'pick', 'use', 'switch', 'to', 'the']
-    words = target_clean.split()
-    cleaned_words = [word for word in words if word not in command_words]
+    target = target.strip()
+    print(f"[SELECT DEBUG] Trimmed target: '{target}'")
     
-    if not cleaned_words:
-        return None, "Please specify which field to select."
-    
-    target_clean = ' '.join(cleaned_words)
-    print(f"[DEBUG] Clean target: '{target_clean}'")
-    
-    # Case 1: Full path provided - just validate it exists and use it
-    if '/' in target_clean:
-        print(f"[DEBUG] Full path provided: {target_clean}")
+    # Case 1: Full path provided (contains /)
+    if '/' in target:
+        print(f"[SELECT DEBUG] Full path provided")
         
-        # Find exact match (case-insensitive)
         for field in field_list:
-            if field.lower() == target_clean:
-                print(f"[DEBUG] Full path found: {field}")
-                # DIRECTLY pass to metadata extractor - no more verification
-                return load_field_metadata_directly(field, field_loader)
+            if field.lower() == target.lower():
+                print(f"[SELECT DEBUG] Exact match found: {field}")
+                return load_field_directly(field, field_loader)
         
-        return None, f"❌ Path not found: {target_clean}\nDouble-check the path or try 'list fields'."
+        return None, f"❌ Field path not found: {target}"
     
-    # Case 2: Field name only - check for matches
-    print(f"[DEBUG] Field name only: {target_clean}")
+    # Case 2: Field name only
+    print(f"[SELECT DEBUG] Field name only")
     
     matches = []
     for field in field_list:
-        field_name = field.split('/')[-1].lower()
-        if field_name == target_clean:
+        field_name = field.split('/')[-1]
+        if field_name.lower() == target.lower():
             matches.append(field)
     
     if len(matches) == 1:
-        # Single match - directly use it
-        print(f"[DEBUG] Single match: {matches[0]}")
-        return load_field_metadata_directly(matches[0], field_loader)
-    
+        return load_field_directly(matches[0], field_loader)
     elif len(matches) > 1:
-        # Multiple matches - show options and wait for full path
-        print(f"[DEBUG] Multiple matches found: {len(matches)}")
-        response = f"⚠️ Multiple fields named '{target_clean}' found:\n\n"
-        
+        response = f"⚠️ Multiple '{target}' fields found:\n\n"
         for i, field in enumerate(matches, 1):
             response += f"{i}. {field}\n"
-        
-        response += f"\n💡 Select one using full path:\n"
-        response += f"Example: 'select {matches[0]}'"
-        
+        response += f"\n💡 Use full path: 'select {matches[0]}'"
         return None, response
-    
     else:
-        return None, f"❌ No field named '{target_clean}' found. Try 'search {target_clean}' to find similar fields."
+        return None, f"❌ No field named '{target}' found."
 
-def load_field_metadata_directly(field_path: str, field_loader) -> tuple:
-    """Load metadata directly without re-verification"""
-    
-    print(f"[DEBUG] Loading metadata for: {field_path}")
-    
+def load_field_directly(field_path: str, field_loader) -> tuple:
+    """Load field metadata directly"""
     try:
-        field_metadata = field_loader.get_field_metadata(field_path)
-        
-        if not field_metadata:
-            return None, f"❌ Found field but couldn't load metadata: {field_path}"
-        
-        field_name = field_path.split('/')[-1]
-        response = f"✅ Selected: {field_name}\n📍 Path: {field_path}\n\n💡 Say 'generate' to create test cases."
-        
-        return field_path, response
-        
+        metadata = field_loader.get_field_metadata(field_path)
+        if metadata:
+            field_name = field_path.split('/')[-1]
+            return field_path, f"✅ Selected: {field_name}\n📍 {field_path}"
+        else:
+            return None, f"❌ Couldn't load metadata for: {field_path}"
     except Exception as e:
-        return None, f"❌ Error loading metadata for {field_path}: {str(e)}"
-```
-
-## **Expected Flow Now**
-
-### **Scenario 1: Unique field name**
-```
-User: "select emailaddress"
-System: ✅ Selected: emailaddress
-         📍 Path: customer/contact/emailaddress
-```
-
-### **Scenario 2: Multiple matches**  
-```
-User: "select postalcode"
-System: ⚠️ Multiple fields named 'postalcode' found:
-
-        1. customer/address/postalcode
-        2. billing/address/postalcode  
-        3. shipping/address/postalcode
-
-        💡 Select one using full path:
-        Example: 'select customer/address/postalcode'
-```
-
-### **Scenario 3: User provides full path**
-```
-User: "select customer/address/postalcode" 
-System: ✅ Selected: postalcode
-         📍 Path: customer/address/postalcode
-         
-         💡 Say 'generate' to create test cases.
-```
-
-## **Key Benefits**
-
-1. **No Re-verification**: Full paths go directly to metadata loader
-2. **Single Decision Point**: Either unique match → load, or multiple → ask for path  
-3. **Clear User Flow**: Show exact paths, user picks one, system uses it
-4. **No Complex Logic**: No fuzzy matching, no scoring, no multiple verification steps
-5. **Fast**: Direct path to metadata extraction
-
-## **Remove Unnecessary Functions**
-
-You can now **delete**:
-- `find_field_fuzzy()` 
-- `suggest_field_disambiguation()`
-- All the complex matching logic
-
-## **Update Your Conversation Handler**
-
-Make sure when field is selected, it's stored properly:
-
-```python
-# In your main conversation loop
-if intent == 'select_field':
-    selected_field, response = handle_select_field(
-        params.get('target', ''), field_list, field_loader)
-    
-    if selected_field:
-        # Field successfully selected
-        session.current_field = selected_field
-        session.current_field_metadata = field_loader.get_field_metadata(selected_field)
-        generator.current_field_name = session.current_field_metadata.get('field_name')
-        
-        print(f"🤖 Assistant: {response}")
-    else:
-        # Show disambiguation or error
-        print(f"🤖 Assistant: {response}")
-```
-
-This approach is much cleaner, faster, and more predictable!
+        return None, f"❌ Error: {str(e)}"
