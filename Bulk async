@@ -1,0 +1,360 @@
+That's a critical consideration for production systems. Here are several error handling strategies for async batch processing:
+
+## **1. Individual Task Error Handling with Retries**
+
+```python
+async def generate_for_field_async_with_retry(self, field_metadata: dict, max_retries: int = 3) -> Dict[str, Any]:
+    """Async generation with retry logic and comprehensive error handling"""
+    
+    field_name = field_metadata.get('field_name', 'Unknown')
+    
+    for attempt in range(max_retries):
+        try:
+            # Extract Java context (CPU-bound, keep synchronous)
+            java_context = self._extract_java_context_sync(field_metadata)
+            conversation_context = self._extract_conversation_context()
+            
+            # Build AI prompt
+            prompt = self._build_ai_prompt(field_metadata, java_context, conversation_context)
+            
+            # Make async API call with timeout
+            completion_coroutine = self.client.chat_completion_async(prompt)
+            
+            # Add timeout to prevent hanging
+            try:
+                response = await asyncio.wait_for(completion_coroutine, timeout=30.0)
+            except asyncio.TimeoutError:
+                if attempt < max_retries - 1:
+                    print(f"[RETRY] Timeout for {field_name}, attempt {attempt + 1}")
+                    await asyncio.sleep(2 ** attempt)  # Exponential backoff
+                    continue
+                else:
+                    raise Exception("API call timed out after retries")
+            
+            content = response.choices[0].message.content.strip()
+            
+            # Check for "I don't know" responses
+            if "sorry" in content.lower() and "don't know" in content.lower():
+                if attempt < max_retries - 1:
+                    print(f"[RETRY] AI couldn't answer for {field_name}, attempt {attempt + 1}")
+                    # Try with fallback prompt
+                    fallback_prompt = self._create_fallback_prompt(prompt)
+                    fallback_coroutine = self.client.chat_completion_async(fallback_prompt)
+                    response = await asyncio.wait_for(fallback_coroutine, timeout=30.0)
+                    content = response.choices[0].message.content.strip()
+            
+            # Parse and store results
+            new_tc_ids = self.test_manager.parse_and_add_test_cases(
+                content,
+                default_mapping=field_metadata.get("backend_xpath", ""),
+                field_name=field_name
+            )
+            
+            if new_tc_ids:
+                return {
+                    'success': True,
+                    'field_name': field_name,
+                    'test_cases_generated': len(new_tc_ids),
+                    'test_case_ids': new_tc_ids,
+                    'attempts': attempt + 1
+                }
+            else:
+                if attempt < max_retries - 1:
+                    print(f"[RETRY] No test cases parsed for {field_name}, attempt {attempt + 1}")
+                    await asyncio.sleep(1)
+                    continue
+                else:
+                    return {
+                        'success': False,
+                        'field_name': field_name,
+                        'error': 'No test cases could be generated after retries',
+                        'attempts': max_retries
+                    }
+            
+        except Exception as e:
+            error_msg = str(e)
+            
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                print(f"[RETRY] Error for {field_name} (attempt {attempt + 1}): {error_msg}")
+                print(f"[RETRY] Waiting {wait_time}s before retry...")
+                await asyncio.sleep(wait_time)
+            else:
+                return {
+                    'success': False,
+                    'field_name': field_name,
+                    'error': error_msg,
+                    'attempts': max_retries
+                }
+    
+    # Should never reach here, but safety fallback
+    return {
+        'success': False,
+        'field_name': field_name,
+        'error': 'Unexpected retry logic failure',
+        'attempts': max_retries
+    }
+```
+
+## **2. Batch Processing with Circuit Breaker**
+
+```python
+class CircuitBreaker:
+    """Circuit breaker to stop processing if too many failures occur"""
+    
+    def __init__(self, failure_threshold: int = 5, time_window: int = 60):
+        self.failure_threshold = failure_threshold
+        self.time_window = time_window
+        self.failures = []
+        self.is_open = False
+    
+    def record_failure(self):
+        """Record a failure"""
+        now = time.time()
+        self.failures.append(now)
+        
+        # Remove old failures outside time window
+        self.failures = [f for f in self.failures if now - f <= self.time_window]
+        
+        # Check if we should open the circuit
+        if len(self.failures) >= self.failure_threshold:
+            self.is_open = True
+            print(f"[CIRCUIT BREAKER] Opened after {len(self.failures)} failures in {self.time_window}s")
+    
+    def can_proceed(self) -> bool:
+        """Check if we can proceed with operations"""
+        if not self.is_open:
+            return True
+        
+        # Auto-reset circuit breaker after some time
+        if self.failures and time.time() - self.failures[-1] > 120:  # 2 minutes
+            self.is_open = False
+            self.failures.clear()
+            print("[CIRCUIT BREAKER] Reset - attempting to resume operations")
+            return True
+        
+        return False
+
+async def bulk_generate_async_with_circuit_breaker(self, fields: List[dict], 
+                                                  max_concurrent: int = 10) -> Dict[str, Any]:
+    """Async bulk generation with circuit breaker pattern"""
+    
+    circuit_breaker = CircuitBreaker(failure_threshold=5, time_window=60)
+    
+    # Validate fields
+    valid_fields = []
+    invalid_fields = []
+    
+    for field in fields:
+        is_valid, error_msg = self._validate_field_data(field)
+        if is_valid:
+            valid_fields.append(field)
+        else:
+            invalid_fields.append({'field': field.get('field_name', 'unknown'), 'error': error_msg})
+    
+    if not valid_fields:
+        return {
+            'success': False,
+            'error': 'No valid fields found',
+            'invalid_fields': invalid_fields
+        }
+    
+    semaphore = asyncio.Semaphore(max_concurrent)
+    results = []
+    completed = 0
+    circuit_breaker_triggered = False
+    
+    async def generate_with_breaker(field_metadata):
+        nonlocal circuit_breaker_triggered
+        
+        if not circuit_breaker.can_proceed():
+            circuit_breaker_triggered = True
+            return {
+                'success': False,
+                'field_name': field_metadata.get('field_name', 'unknown'),
+                'error': 'Circuit breaker open - too many failures',
+                'skipped': True
+            }
+        
+        async with semaphore:
+            result = await self.generate_for_field_async_with_retry(field_metadata)
+            
+            if not result['success']:
+                circuit_breaker.record_failure()
+            
+            return result
+    
+    # Create all tasks
+    tasks = [generate_with_breaker(field) for field in valid_fields]
+    
+    print(f"[INFO] Processing {len(tasks)} fields with circuit breaker protection...")
+    
+    # Process with progress tracking
+    for task in asyncio.as_completed(tasks):
+        try:
+            result = await task
+            results.append(result)
+            completed += 1
+            
+            if completed % 10 == 0:
+                successful = len([r for r in results if r['success']])
+                failed = len([r for r in results if not r['success']])
+                print(f"[PROGRESS] Completed {completed}/{len(tasks)} - Success: {successful}, Failed: {failed}")
+            
+            # Check if circuit breaker was triggered
+            if circuit_breaker_triggered:
+                print(f"[CIRCUIT BREAKER] Stopping processing due to too many failures")
+                # Cancel remaining tasks
+                for remaining_task in tasks:
+                    if not remaining_task.done():
+                        remaining_task.cancel()
+                break
+                
+        except asyncio.CancelledError:
+            print(f"[INFO] Task cancelled due to circuit breaker")
+            results.append({
+                'success': False,
+                'field_name': 'cancelled',
+                'error': 'Cancelled due to circuit breaker'
+            })
+        except Exception as e:
+            print(f"[ERROR] Unexpected task error: {str(e)}")
+            results.append({
+                'success': False,
+                'field_name': 'unknown',
+                'error': f'Unexpected error: {str(e)}'
+            })
+    
+    # Process successful results
+    successful_results = [r for r in results if r.get('success', False)]
+    failed_results = [r for r in results if not r.get('success', False)]
+    
+    # Auto-approve and complete successful fields
+    total_test_cases = 0
+    for result in successful_results:
+        field_name = result['field_name']
+        test_case_ids = result.get('test_case_ids', [])
+        
+        if test_case_ids:
+            self.test_manager.approve_test_cases(test_case_ids)
+            total_test_cases += len(test_case_ids)
+        
+        # Auto-complete field
+        self.current_field_name = field_name
+        if field_name in self.field_contexts:
+            self.complete_current_field()
+    
+    return {
+        'success': len(successful_results) > 0,
+        'processed': len(successful_results),
+        'failed': len(failed_results),
+        'circuit_breaker_triggered': circuit_breaker_triggered,
+        'success_rate': round((len(successful_results) / len(results)) * 100, 2) if results else 0,
+        'total_test_cases': total_test_cases,
+        'invalid_fields': invalid_fields,
+        'failed_fields': [r.get('field_name', 'unknown') for r in failed_results if not r.get('skipped', False)],
+        'skipped_fields': [r.get('field_name', 'unknown') for r in failed_results if r.get('skipped', False)]
+    }
+```
+
+## **3. Checkpoint and Resume Functionality**
+
+```python
+async def bulk_generate_with_checkpoints(self, fields: List[dict], 
+                                        checkpoint_file: str = "batch_progress.json",
+                                        max_concurrent: int = 10) -> Dict[str, Any]:
+    """Bulk generation with checkpoint/resume capability"""
+    
+    # Load existing checkpoint if it exists
+    processed_fields = set()
+    if os.path.exists(checkpoint_file):
+        try:
+            with open(checkpoint_file, 'r') as f:
+                checkpoint_data = json.load(f)
+                processed_fields = set(checkpoint_data.get('processed_fields', []))
+                print(f"[CHECKPOINT] Resuming from checkpoint - {len(processed_fields)} fields already processed")
+        except Exception as e:
+            print(f"[WARN] Could not load checkpoint: {e}")
+    
+    # Filter out already processed fields
+    remaining_fields = [f for f in fields if f.get('field_name') not in processed_fields]
+    
+    if not remaining_fields:
+        print("[INFO] All fields already processed!")
+        return {'success': True, 'processed': len(processed_fields), 'resumed_from_checkpoint': True}
+    
+    print(f"[INFO] Processing {len(remaining_fields)} remaining fields")
+    
+    async def generate_with_checkpoint(field_metadata):
+        result = await self.generate_for_field_async_with_retry(field_metadata)
+        
+        # Update checkpoint on each success
+        if result['success']:
+            processed_fields.add(field_metadata.get('field_name'))
+            
+            # Save checkpoint every 10 successful completions
+            if len(processed_fields) % 10 == 0:
+                try:
+                    checkpoint_data = {
+                        'processed_fields': list(processed_fields),
+                        'last_updated': time.time(),
+                        'total_processed': len(processed_fields)
+                    }
+                    with open(checkpoint_file, 'w') as f:
+                        json.dump(checkpoint_data, f)
+                    print(f"[CHECKPOINT] Saved progress: {len(processed_fields)} completed")
+                except Exception as e:
+                    print(f"[WARN] Could not save checkpoint: {e}")
+        
+        return result
+    
+    # Process remaining fields
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def process_with_semaphore(field_metadata):
+        async with semaphore:
+            return await generate_with_checkpoint(field_metadata)
+    
+    tasks = [process_with_semaphore(field) for field in remaining_fields]
+    results = []
+    
+    try:
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            results.append(result)
+    except KeyboardInterrupt:
+        print(f"\n[INTERRUPT] Stopping gracefully... Progress saved to {checkpoint_file}")
+        # Save final checkpoint
+        checkpoint_data = {
+            'processed_fields': list(processed_fields),
+            'last_updated': time.time(),
+            'interrupted': True
+        }
+        with open(checkpoint_file, 'w') as f:
+            json.dump(checkpoint_data, f)
+        return {'success': False, 'interrupted': True, 'processed': len(processed_fields)}
+    
+    # Clean up checkpoint file on successful completion
+    if os.path.exists(checkpoint_file):
+        os.remove(checkpoint_file)
+        print("[CHECKPOINT] Removed checkpoint file - batch completed successfully")
+    
+    successful_results = [r for r in results if r['success']]
+    return {
+        'success': len(successful_results) > 0,
+        'processed': len(successful_results),
+        'failed': len(results) - len(successful_results),
+        'total_processed_including_previous': len(processed_fields)
+    }
+```
+
+## **Key Error Handling Features**
+
+1. **Individual Retries**: Each failed API call retries up to 3 times with exponential backoff
+2. **Timeout Protection**: Prevents hanging on slow API calls
+3. **Circuit Breaker**: Stops processing if failure rate gets too high
+4. **Checkpointing**: Resume from where you left off if batch processing is interrupted
+5. **Graceful Degradation**: Continue processing other fields even if some fail
+6. **Comprehensive Logging**: Track what succeeded, failed, and why
+
+This approach ensures that a few failed API calls don't bring down the entire batch processing operation, and you can resume large batches if interrupted.
