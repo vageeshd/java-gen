@@ -1,0 +1,846 @@
+Perfect! Let's implement Prompt-Based MCP in phases. Here's the roadmap and Phase 1 implementation:
+
+## **Phase Breakdown**
+
+### **Phase 1: Core MCP Infrastructure (Week 1-2)**
+- Tool registration system
+- Basic prompt-based tool calling
+- Response parsing
+- 3-4 core tools to prove concept
+
+### **Phase 2: Tool Expansion (Week 3-4)**
+- Convert all existing functions to tools
+- Enhanced error handling
+- Tool chaining capabilities
+
+### **Phase 3: Advanced Orchestration (Week 5-6)**
+- Multi-step workflows
+- Context awareness
+- Learning and adaptation
+
+---
+
+## **Phase 1 Implementation**
+
+### **1. NEW FILE: `mcp_tools.py`**
+Create this new file for tool definitions:
+
+```python
+from typing import Dict, Any, List, Optional, Callable
+from dataclasses import dataclass
+from datetime import datetime
+import json
+
+@dataclass
+class Tool:
+    """Tool definition for MCP system"""
+    name: str
+    description: str
+    parameters: Dict[str, Any]
+    function: Callable
+    examples: List[str]
+    category: str = "general"
+
+class MCPToolRegistry:
+    """Registry for MCP tools"""
+    
+    def __init__(self):
+        self.tools: Dict[str, Tool] = {}
+        self.categories: Dict[str, List[str]] = {}
+    
+    def register_tool(self, tool: Tool):
+        """Register a tool in the system"""
+        self.tools[tool.name] = tool
+        
+        if tool.category not in self.categories:
+            self.categories[tool.category] = []
+        self.categories[tool.category].append(tool.name)
+        
+        print(f"[MCP] Registered tool: {tool.name}")
+    
+    def get_tool(self, name: str) -> Optional[Tool]:
+        """Get tool by name"""
+        return self.tools.get(name)
+    
+    def get_tools_by_category(self, category: str) -> List[Tool]:
+        """Get all tools in a category"""
+        tool_names = self.categories.get(category, [])
+        return [self.tools[name] for name in tool_names]
+    
+    def get_all_tools(self) -> List[Tool]:
+        """Get all registered tools"""
+        return list(self.tools.values())
+    
+    def generate_tool_schema(self) -> str:
+        """Generate tool schema for LLM prompt"""
+        schema_parts = []
+        
+        for category, tool_names in self.categories.items():
+            schema_parts.append(f"\n**{category.upper()} TOOLS:**")
+            
+            for tool_name in tool_names:
+                tool = self.tools[tool_name]
+                schema_parts.append(f"- {tool.name}({self._format_parameters(tool.parameters)})")
+                schema_parts.append(f"  Description: {tool.description}")
+                
+                if tool.examples:
+                    schema_parts.append(f"  Examples: {'; '.join(tool.examples)}")
+        
+        return "\n".join(schema_parts)
+    
+    def _format_parameters(self, params: Dict[str, Any]) -> str:
+        """Format parameters for schema display"""
+        if not params:
+            return ""
+        
+        param_strs = []
+        for name, info in params.items():
+            param_type = info.get('type', 'string')
+            required = " [required]" if info.get('required', False) else " [optional]"
+            param_strs.append(f"{name}: {param_type}{required}")
+        
+        return ", ".join(param_strs)
+
+# Global tool registry
+tool_registry = MCPToolRegistry()
+```
+
+### **2. NEW FILE: `mcp_orchestrator.py`**
+Create the orchestrator that handles tool selection:
+
+```python
+import re
+import json
+from typing import Dict, Any, List, Optional, Tuple
+from .mcp_tools import tool_registry, Tool
+
+class MCPOrchestrator:
+    """Orchestrates tool selection and execution based on user input"""
+    
+    def __init__(self, client, conversation_manager=None):
+        self.client = client
+        self.conversation_manager = conversation_manager
+        self.execution_history = []
+        self.context_state = {}
+    
+    def process_user_request(self, user_input: str, session_context: Dict = None) -> Dict[str, Any]:
+        """Main entry point for processing user requests via MCP"""
+        
+        print(f"[MCP] Processing: {user_input}")
+        
+        try:
+            # Step 1: Analyze request and select tools
+            tool_plan = self._analyze_and_plan(user_input, session_context or {})
+            
+            if not tool_plan.get('tools'):
+                return {
+                    'success': False,
+                    'response': "I couldn't understand what you want to do. Could you rephrase that?",
+                    'action_taken': 'analysis_failed'
+                }
+            
+            # Step 2: Execute tool plan
+            results = self._execute_tool_plan(tool_plan, user_input)
+            
+            # Step 3: Format response
+            return self._format_response(results, user_input)
+            
+        except Exception as e:
+            print(f"[MCP ERROR] {str(e)}")
+            return {
+                'success': False,
+                'response': f"Something went wrong: {str(e)}",
+                'action_taken': 'error'
+            }
+    
+    def _analyze_and_plan(self, user_input: str, context: Dict) -> Dict[str, Any]:
+        """Analyze user input and create execution plan"""
+        
+        # Build analysis prompt
+        prompt = self._build_analysis_prompt(user_input, context)
+        
+        # Get LLM analysis
+        try:
+            response = self.client.chat_completion(prompt)
+            analysis_text = response.choices[0].message.content.strip()
+            
+            # Parse the analysis
+            tool_plan = self._parse_tool_plan(analysis_text)
+            
+            print(f"[MCP] Planned tools: {[t['name'] for t in tool_plan.get('tools', [])]}")
+            return tool_plan
+            
+        except Exception as e:
+            print(f"[MCP] Analysis failed: {e}")
+            return {'tools': [], 'reasoning': 'Analysis failed'}
+    
+    def _build_analysis_prompt(self, user_input: str, context: Dict) -> str:
+        """Build prompt for tool analysis"""
+        
+        # Get available tools
+        tool_schema = tool_registry.generate_tool_schema()
+        
+        prompt = f"""You are a tool selection AI. Analyze the user's request and determine which tools to use.
+
+AVAILABLE TOOLS:
+{tool_schema}
+
+CURRENT CONTEXT:
+- Current field: {context.get('current_field', 'None')}
+- Session state: {context.get('session_stats', {})}
+- Recent actions: {context.get('recent_actions', [])}
+
+USER REQUEST: "{user_input}"
+
+Analyze this request and respond in this EXACT format:
+
+ANALYSIS: [Brief explanation of what the user wants]
+TOOLS: [List of tool names to use, in order]
+PARAMETERS: [JSON object with parameters for each tool]
+
+Example response:
+ANALYSIS: User wants to generate test cases for current field
+TOOLS: generate_test_cases
+PARAMETERS: {{"generate_test_cases": {{"field_name": "current", "requirements": "standard validation"}}}}
+
+Your response:"""
+        
+        return prompt
+    
+    def _parse_tool_plan(self, analysis_text: str) -> Dict[str, Any]:
+        """Parse LLM analysis into executable plan"""
+        
+        plan = {'tools': [], 'reasoning': '', 'parameters': {}}
+        
+        try:
+            # Extract analysis
+            analysis_match = re.search(r'ANALYSIS:\s*(.+?)(?=TOOLS:)', analysis_text, re.DOTALL)
+            if analysis_match:
+                plan['reasoning'] = analysis_match.group(1).strip()
+            
+            # Extract tools
+            tools_match = re.search(r'TOOLS:\s*(.+?)(?=PARAMETERS:)', analysis_text, re.DOTALL)
+            if tools_match:
+                tools_text = tools_match.group(1).strip()
+                tool_names = [t.strip() for t in tools_text.replace(',', '\n').split('\n') if t.strip()]
+                
+                for tool_name in tool_names:
+                    if tool_registry.get_tool(tool_name):
+                        plan['tools'].append({'name': tool_name})
+            
+            # Extract parameters
+            params_match = re.search(r'PARAMETERS:\s*(.+)', analysis_text, re.DOTALL)
+            if params_match:
+                params_text = params_match.group(1).strip()
+                try:
+                    plan['parameters'] = json.loads(params_text)
+                except:
+                    print(f"[MCP] Failed to parse parameters: {params_text}")
+            
+        except Exception as e:
+            print(f"[MCP] Plan parsing error: {e}")
+        
+        return plan
+    
+    def _execute_tool_plan(self, plan: Dict, original_input: str) -> List[Dict]:
+        """Execute the planned tools"""
+        
+        results = []
+        
+        for tool_info in plan.get('tools', []):
+            tool_name = tool_info['name']
+            tool = tool_registry.get_tool(tool_name)
+            
+            if not tool:
+                results.append({
+                    'tool': tool_name,
+                    'success': False,
+                    'error': f"Tool {tool_name} not found"
+                })
+                continue
+            
+            # Get parameters for this tool
+            tool_params = plan.get('parameters', {}).get(tool_name, {})
+            
+            # Add context if needed
+            if 'original_input' not in tool_params:
+                tool_params['original_input'] = original_input
+            
+            try:
+                print(f"[MCP] Executing {tool_name} with params: {tool_params}")
+                
+                # Execute the tool
+                result = tool.function(**tool_params)
+                
+                results.append({
+                    'tool': tool_name,
+                    'success': True,
+                    'result': result,
+                    'params_used': tool_params
+                })
+                
+                # Update context state
+                self._update_context_state(tool_name, result)
+                
+            except Exception as e:
+                print(f"[MCP] Tool {tool_name} failed: {e}")
+                results.append({
+                    'tool': tool_name,
+                    'success': False,
+                    'error': str(e),
+                    'params_used': tool_params
+                })
+        
+        return results
+    
+    def _update_context_state(self, tool_name: str, result: Any):
+        """Update orchestrator context based on tool execution"""
+        
+        # Track recent actions
+        if 'recent_actions' not in self.context_state:
+            self.context_state['recent_actions'] = []
+        
+        self.context_state['recent_actions'].append({
+            'tool': tool_name,
+            'timestamp': datetime.now(),
+            'success': True
+        })
+        
+        # Keep only last 5 actions
+        if len(self.context_state['recent_actions']) > 5:
+            self.context_state['recent_actions'] = self.context_state['recent_actions'][-5:]
+    
+    def _format_response(self, results: List[Dict], original_input: str) -> Dict[str, Any]:
+        """Format tool execution results into user response"""
+        
+        if not results:
+            return {
+                'success': False,
+                'response': "No tools were executed.",
+                'action_taken': 'no_execution'
+            }
+        
+        successful_results = [r for r in results if r['success']]
+        failed_results = [r for r in results if not r['success']]
+        
+        if not successful_results:
+            return {
+                'success': False,
+                'response': f"All tools failed. Errors: {[r['error'] for r in failed_results]}",
+                'action_taken': 'all_tools_failed'
+            }
+        
+        # Get the primary result (last successful tool)
+        primary_result = successful_results[-1]['result']
+        
+        # Format based on result type
+        if isinstance(primary_result, dict):
+            response = primary_result.get('response', str(primary_result))
+            action_taken = primary_result.get('action_taken', 'tool_executed')
+            
+            return {
+                'success': True,
+                'response': response,
+                'action_taken': action_taken,
+                'tools_executed': [r['tool'] for r in successful_results],
+                'details': primary_result
+            }
+        else:
+            return {
+                'success': True,
+                'response': str(primary_result),
+                'action_taken': 'tool_executed',
+                'tools_executed': [r['tool'] for r in successful_results]
+            }
+```
+
+### **3. MODIFY: `complete_test_objective_core.py`**
+
+**ADD these imports at the top:**
+```python
+from .mcp_tools import tool_registry, Tool
+from .mcp_orchestrator import MCPOrchestrator
+```
+
+**ADD this method to TestObjectiveGeneratorCore class:**
+```python
+def register_as_mcp_tools(self):
+    """Register core functions as MCP tools"""
+    
+    # Tool 1: Generate Test Cases
+    generate_tool = Tool(
+        name="generate_test_cases",
+        description="Generate test cases for a specified field",
+        parameters={
+            "field_name": {"type": "string", "required": False, "description": "Field name (uses current field if not specified)"},
+            "requirements": {"type": "string", "required": False, "description": "Specific requirements or focus areas"}
+        },
+        function=self._mcp_generate_test_cases,
+        examples=["generate test cases", "create tests for postal code"],
+        category="generation"
+    )
+    tool_registry.register_tool(generate_tool)
+    
+    # Tool 2: Process Feedback
+    process_feedback_tool = Tool(
+        name="process_feedback",
+        description="Process user feedback about test cases (questions, modifications, improvements)",
+        parameters={
+            "feedback": {"type": "string", "required": True, "description": "User feedback or question"},
+            "field_name": {"type": "string", "required": False, "description": "Target field name"}
+        },
+        function=self._mcp_process_feedback,
+        examples=["change TC_001 to test Canadian postal codes", "what does TC_002 validate?"],
+        category="feedback"
+    )
+    tool_registry.register_tool(process_feedback_tool)
+    
+    # Tool 3: Get Pending Cases  
+    get_pending_tool = Tool(
+        name="get_pending_cases",
+        description="Show pending test cases that need review",
+        parameters={
+            "field_name": {"type": "string", "required": False, "description": "Filter by field name"}
+        },
+        function=self._mcp_get_pending_cases,
+        examples=["show pending", "what do we have", "review test cases"],
+        category="review"
+    )
+    tool_registry.register_tool(get_pending_tool)
+    
+    # Tool 4: Export Results
+    export_tool = Tool(
+        name="export_results",
+        description="Export approved test cases to Excel file",
+        parameters={
+            "format": {"type": "string", "required": False, "description": "Export format (default: excel)"}
+        },
+        function=self._mcp_export_results,
+        examples=["export", "save to excel", "download results"],
+        category="export"
+    )
+    tool_registry.register_tool(export_tool)
+
+def _mcp_generate_test_cases(self, field_name: str = None, requirements: str = "", original_input: str = "") -> Dict[str, Any]:
+    """MCP wrapper for generate_for_field"""
+    
+    # Use current field if no field specified
+    if not field_name or field_name == "current":
+        if not self.current_field_name or not self.field_contexts.get(self.current_field_name):
+            return {
+                'success': False,
+                'response': "No field is currently selected. Please select a field first.",
+                'action_taken': 'no_field_selected'
+            }
+        field_metadata = self.field_contexts[self.current_field_name]['metadata']
+    else:
+        # TODO: In Phase 2, add field lookup by name
+        return {
+            'success': False,
+            'response': f"Field lookup not yet implemented. Please select field first.",
+            'action_taken': 'field_lookup_pending'
+        }
+    
+    try:
+        success = self.generate_for_field(field_metadata)
+        
+        if success:
+            # Get generated cases for display
+            generated_cases = self.test_manager.get_field_test_cases(self.current_field_name)
+            pending_cases = [case for case in generated_cases if case.get('Status') == 'pending']
+            
+            response = f"✅ Generated {len(pending_cases)} test cases for {field_metadata.get('field_name', 'current field')}:\n"
+            for case in pending_cases[-3:]:  # Show last 3
+                tc_id = case.get('Test Case ID', 'N/A')
+                objective = case.get('Test Objective', 'N/A')
+                response += f"- {tc_id}: {objective}\n"
+            
+            response += f"\nSay 'show pending' to review all cases or 'approve TC_001' to approve specific ones."
+            
+            return {
+                'success': True,
+                'response': response,
+                'action_taken': 'test_cases_generated',
+                'generated_count': len(pending_cases)
+            }
+        else:
+            return {
+                'success': False,
+                'response': "Failed to generate test cases. Please try again or check the field configuration.",
+                'action_taken': 'generation_failed'
+            }
+            
+    except Exception as e:
+        return {
+            'success': False,
+            'response': f"Error generating test cases: {str(e)}",
+            'action_taken': 'generation_error'
+        }
+
+def _mcp_process_feedback(self, feedback: str, field_name: str = None, original_input: str = "") -> Dict[str, Any]:
+    """MCP wrapper for process_user_feedback"""
+    
+    # Use current field if no field specified
+    if not field_name:
+        if not self.current_field_name:
+            return {
+                'success': False,
+                'response': "No field is currently selected. Please select a field first.",
+                'action_taken': 'no_field_selected'
+            }
+        field_metadata = self.field_contexts.get(self.current_field_name, {}).get('metadata', {})
+        field_metadata['field_name'] = self.current_field_name
+    else:
+        # TODO: Phase 2 - field lookup
+        field_metadata = {'field_name': field_name}
+    
+    try:
+        result = self.process_user_feedback(feedback, field_metadata)
+        return {
+            'success': not result.get('error'),
+            'response': result.get('response', 'Feedback processed'),
+            'action_taken': result.get('action_taken', 'feedback_processed'),
+            'is_question': result.get('is_question', False),
+            'new_test_cases': result.get('new_test_cases', []),
+            'modifications_created': result.get('modifications_created', [])
+        }
+        
+    except Exception as e:
+        return {
+            'success': False,
+            'response': f"Error processing feedback: {str(e)}",
+            'action_taken': 'feedback_error'
+        }
+
+def _mcp_get_pending_cases(self, field_name: str = None, original_input: str = "") -> Dict[str, Any]:
+    """MCP wrapper for getting pending cases"""
+    
+    try:
+        if field_name:
+            pending_cases = self.test_manager.get_field_test_cases(field_name)
+            pending_cases = [case for case in pending_cases if case.get('Status') == 'pending']
+        else:
+            pending_cases = self.test_manager.get_pending_cases()
+        
+        if not pending_cases:
+            return {
+                'success': True,
+                'response': "No pending test cases to review. Generate some test cases first!",
+                'action_taken': 'no_pending_cases'
+            }
+        
+        response = f"📋 Found {len(pending_cases)} pending test cases:\n\n"
+        for case in pending_cases:
+            tc_id = case.get('Test Case ID', 'N/A')
+            val_type = case.get('Type of Validation', 'N/A')
+            objective = case.get('Test Objective', 'N/A')
+            
+            response += f"{tc_id} - {val_type}\n"
+            response += f"   📝 {objective}\n\n"
+        
+        response += "💡 Say 'approve TC_001' to approve specific cases or 'approve all' to approve everything."
+        
+        return {
+            'success': True,
+            'response': response,
+            'action_taken': 'pending_cases_displayed',
+            'pending_count': len(pending_cases)
+        }
+        
+    except Exception as e:
+        return {
+            'success': False,
+            'response': f"Error getting pending cases: {str(e)}",
+            'action_taken': 'get_pending_error'
+        }
+
+def _mcp_export_results(self, format: str = "excel", original_input: str = "") -> Dict[str, Any]:
+    """MCP wrapper for export functionality"""
+    
+    try:
+        # Auto-complete current field if ready
+        if self.current_field_name and self.is_field_ready_for_completion():
+            completion_result = self.complete_current_field()
+            print(f"[MCP] Auto-completed field: {completion_result.get('completed_field')}")
+        
+        # Check for approved cases
+        approved_cases = self.test_manager.get_approved_cases()
+        if not approved_cases:
+            return {
+                'success': False,
+                'response': "No approved test cases to export. Please approve some test cases first.",
+                'action_taken': 'no_approved_cases'
+            }
+        
+        # Export
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"test_cases_{timestamp}.xlsx"
+        
+        success = self.export_all_completed_fields(filename)
+        
+        if success:
+            return {
+                'success': True,
+                'response': f"✅ Successfully exported {len(approved_cases)} test cases to {filename}",
+                'action_taken': 'export_completed',
+                'filename': filename,
+                'cases_exported': len(approved_cases)
+            }
+        else:
+            return {
+                'success': False,
+                'response': "Export failed. Please try again.",
+                'action_taken': 'export_failed'
+            }
+            
+    except Exception as e:
+        return {
+            'success': False,
+            'response': f"Export error: {str(e)}",
+            'action_taken': 'export_error'
+        }
+```
+
+### **4. MODIFY: `complete_agentic_test_generator.py`**
+
+**ADD at the top with other imports:**
+```python
+from .mcp_orchestrator import MCPOrchestrator
+```
+
+**REPLACE the `conversational_interactive_mode` function signature:**
+```python
+def conversational_interactive_mode(generator: TestObjectiveGeneratorCore, field_loader: FieldMetadataLoader) -> bool:
+    """Enhanced conversational mode with MCP orchestration"""
+    
+    # Initialize conversation components
+    convo_mgr = SimpleConversationManager(50)
+    session = ConversationalSession(convo_mgr)
+    
+    # NEW: Initialize MCP orchestrator
+    orchestrator = MCPOrchestrator(generator.client, convo_mgr)
+    
+    # NEW: Register tools
+    generator.register_as_mcp_tools()
+    
+    print("🤖 CONVERSATIONAL TEST CASE GENERATOR (MCP Enhanced)")
+    print("Talk to me naturally! I understand what you want to do using smart tool selection.")
+    print("=" * 80)
+```
+
+**REPLACE the main processing loop with:**
+```python
+while True:
+    # Show context if available
+    if session.current_field:
+        field_name = session.current_field.split('/')[-1]
+        stats = session.session_context
+        status_text = f"Working on: {field_name}"
+        if stats['generated_count'] > 0:
+            status_text += f" | Generated: {stats['generated_count']} | Approved: {stats['approved_count']}"
+        print(f"\n{status_text}")
+
+    user_input = input("\n💬 You: ").strip()
+
+    if not user_input:
+        continue
+
+    # Check for exit
+    if user_input.lower() in ['exit', 'quit', 'bye']:
+        break
+
+    try:
+        # NEW: Use MCP orchestrator for processing
+        context = {
+            'current_field': session.current_field,
+            'session_stats': session.session_context,
+            'recent_actions': getattr(session, 'recent_actions', [])
+        }
+        
+        # Update generator context if field is selected
+        if session.current_field and session.current_field_metadata:
+            generator.current_field_name = session.current_field_metadata.get('field_name')
+            if generator.current_field_name not in generator.field_contexts:
+                generator.field_contexts[generator.current_field_name] = {
+                    'metadata': session.current_field_metadata,
+                    'generation_timestamp': datetime.now()
+                }
+        
+        result = orchestrator.process_user_request(user_input, context)
+        
+        print(f"🤖 Assistant: {result['response']}")
+        
+        # Update session stats based on result
+        if result.get('generated_count'):
+            session.update_stats('generated_count', result['generated_count'])
+        
+        # Add to conversation history
+        session.add_interaction(user_input, result['response'], result.get('action_taken', 'mcp_processed'))
+        
+    except Exception as e:
+        print(f"🤖 Assistant: Sorry, I encountered an error: {str(e)}")
+        print("Please try rephrasing your request.")
+        session.add_interaction(user_input, f"Error: {str(e)}", 'error')
+
+return handle_exit_flow(generator)
+```
+
+## **Phase 1 Testing**
+
+After implementing Phase 1, test with these commands:
+- "generate test cases" → Should trigger generate_test_cases tool
+- "show me what we have" → Should trigger get_pending_cases tool  
+- "export everything" → Should trigger export_results tool
+- "change TC_001 to test different data" → Should trigger process_feedback tool
+
+## **What's Next: Phase 2**
+
+After Phase 1 is working:
+1. Add field selection tools (search_fields, select_field)
+2. Add session management tools (get_status, switch_field)
+3. Add approval/rejection tools
+4. Enhanced error handling and tool chaining
+5. Better context management between tools
+
+Would you like me to continue with the complete Phase 1 implementation details, or shall we start testing this first batch?
+
+**Absolutely!** You're 100% right. In Phase 1, I focused on the MCP infrastructure but missed a critical piece - **field selection tools**. 
+
+Here's the issue and quick fix:
+
+## **Current Problem**
+The `generate_test_cases` tool assumes you already have a current field selected, but there's no MCP tool to select fields yet. This means:
+- "generate test cases" will fail with "No field is currently selected"
+- Users have no way to select/switch fields through the MCP system
+
+## **Quick Phase 1 Fix**
+
+### **ADD these two tools to the `register_as_mcp_tools()` method:**
+
+```python
+# Add after the existing 4 tools:
+
+# Tool 5: Select Field
+select_field_tool = Tool(
+    name="select_field",
+    description="Select a field to work on by name",
+    parameters={
+        "field_name": {"type": "string", "required": True, "description": "Name of the field to select"}
+    },
+    function=self._mcp_select_field,
+    examples=["select PostalCode", "work on email field", "use customer name"],
+    category="field_management"
+)
+tool_registry.register_tool(select_field_tool)
+
+# Tool 6: Show Available Fields
+list_fields_tool = Tool(
+    name="list_available_fields", 
+    description="List all available fields from the mapping file",
+    parameters={},
+    function=self._mcp_list_fields,
+    examples=["list fields", "show available fields", "what fields do we have"],
+    category="field_management"
+)
+tool_registry.register_tool(list_fields_tool)
+```
+
+### **ADD these tool functions to the TestObjectiveGeneratorCore class:**
+
+```python
+def _mcp_select_field(self, field_name: str, original_input: str = "") -> Dict[str, Any]:
+    """MCP wrapper for field selection"""
+    try:
+        # This is a simplified version - you'll need to integrate with your field_loader
+        # For now, create a basic field metadata structure
+        field_metadata = {
+            'field_name': field_name,
+            'backend_xpath': f'/{field_name.lower()}',  # Simple default
+            'description': f'{field_name} field validation'
+        }
+        
+        # Set as current field
+        self.current_field_name = field_name
+        self.field_contexts[field_name] = {
+            'metadata': field_metadata,
+            'selection_timestamp': datetime.now(),
+            'attempts': 1
+        }
+        
+        return {
+            'success': True,
+            'response': f"✅ Selected field: {field_name}. You can now generate test cases with 'generate test cases'.",
+            'action_taken': 'field_selected',
+            'selected_field': field_name
+        }
+        
+    except Exception as e:
+        return {
+            'success': False,
+            'response': f"Failed to select field {field_name}: {str(e)}",
+            'action_taken': 'field_selection_failed'
+        }
+
+def _mcp_list_fields(self, original_input: str = "") -> Dict[str, Any]:
+    """MCP wrapper for listing available fields"""
+    try:
+        # Simplified field list for Phase 1 testing
+        # In Phase 2, this will integrate with your field_loader
+        sample_fields = [
+            "PostalCode", "EmailAddress", "PhoneNumber", "CustomerName", 
+            "AccountNumber", "TransactionAmount", "DateOfBirth"
+        ]
+        
+        response = "📋 Available fields for testing:\n\n"
+        for i, field in enumerate(sample_fields, 1):
+            response += f"{i}. {field}\n"
+        
+        response += f"\n💡 Say 'select PostalCode' to work on a specific field."
+        
+        return {
+            'success': True,
+            'response': response,
+            'action_taken': 'fields_listed',
+            'available_fields': sample_fields
+        }
+        
+    except Exception as e:
+        return {
+            'success': False,
+            'response': f"Error listing fields: {str(e)}",
+            'action_taken': 'list_fields_error'
+        }
+```
+
+## **Updated Testing Flow**
+
+Now you can test the complete workflow:
+
+```bash
+# 1. Start by seeing what's available
+"what fields do we have?"
+"list available fields"
+
+# 2. Select a field to work on  
+"select PostalCode"
+"work on EmailAddress"
+
+# 3. Generate test cases (now this will work!)
+"generate test cases" 
+"create some tests"
+
+# 4. Review and export
+"show pending"
+"export results"
+```
+
+## **Why This Quick Fix Works**
+
+1. **Provides field context** - Users can select fields before generating
+2. **Shows available options** - Users know what fields they can work with
+3. **Maintains MCP architecture** - Everything goes through tool selection
+4. **Enables full workflow testing** - Complete end-to-end functionality
+
+In **Phase 2**, we'll properly integrate with your `FieldMetadataLoader` to get real field data from mapping files instead of these hardcoded samples.
+
+**Try this updated version** - it should give you the complete testing experience for the MCP workflow!
